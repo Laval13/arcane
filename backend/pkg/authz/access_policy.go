@@ -95,6 +95,8 @@ var accessSurfacesInternal = []AccessSurface{
 	routeSurfaceInternal("route.customize.templates.create", "/customize/templates/create", "Create template", AccessScopeModeGlobalOnly, []string{PermCustomizeManage, PermTemplatesList, PermTemplatesRead}, 0),
 	routeSurfaceInternal("route.customize.templates.default", "/customize/templates/default", "Default template", AccessScopeModeGlobalOnly, []string{PermCustomizeManage, PermTemplatesList, PermTemplatesRead}, 0),
 	routeSurfaceInternal("route.customize.templates.detail", "/customize/templates/{id}", "Template", AccessScopeModeGlobalOnly, []string{PermCustomizeManage, PermTemplatesList, PermTemplatesRead}, 0),
+	routeSurfaceInternal("route.customize.registries.browse", "/customize/registries/{id}", "Registry repositories", AccessScopeModeGlobalOnly, []string{PermRegistriesBrowse}, 0),
+	routeSurfaceInternal("route.customize.registries.repository", "/customize/registries/{id}/repository", "Registry repository", AccessScopeModeGlobalOnly, []string{PermRegistriesBrowse}, 0),
 
 	settingsCategorySurfaceInternal("activity", "/settings/activity", "Activity", AccessScopeModeGlobalOnly, []string{PermSettingsRead}),
 	settingsCategorySurfaceInternal("apikeys", "/settings/api-keys", "API Keys", AccessScopeModeGlobalOnly, []string{PermApiKeysList, PermApiKeysRead}),

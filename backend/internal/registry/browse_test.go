@@ -101,6 +101,11 @@ func TestContainerRegistryService_ListRepositoriesInternal(t *testing.T) {
 	repositories, _, err = svc.ListRepositories(ctx, namespacedID, browseParamsInternal(""))
 	require.NoError(t, err)
 	assert.Equal(t, []string{"team/api", "team/web"}, repositoryNamesInternal(repositories))
+
+	_, _, err = svc.ListRepositoryTags(ctx, namespacedID, "other/tool", browseParamsInternal(""))
+	assert.ErrorIs(t, err, common.ErrValidation)
+	_, err = svc.DeleteRepositoryTag(ctx, namespacedID, "other/tool", "1.0")
+	assert.ErrorIs(t, err, common.ErrValidation)
 }
 
 func TestContainerRegistryService_ListRepositoryTagsSingleImageInternal(t *testing.T) {

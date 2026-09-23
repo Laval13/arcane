@@ -82,16 +82,26 @@
 	function handleDeleteSelected(ids: string[]) {
 		if (!ids?.length) return;
 		const selectedTags = [...ids];
+		// Tags sharing a digest are deleted together, so a second request for the same digest would 404.
+		const digestByTag = new Map(tags.data.map((tag) => [tag.name, tag.digest]));
+		const seenDigests = new Set<string>();
+		const tagsToDelete = selectedTags.filter((tag) => {
+			const digest = digestByTag.get(tag);
+			if (!digest) return true;
+			if (seenDigests.has(digest)) return false;
+			seenDigests.add(digest);
+			return true;
+		});
 
 		bulkConfirmAndRun({
-			ids: selectedTags,
+			ids: tagsToDelete,
 			title: m.registries_delete_tags_selected_title({ count: selectedTags.length }),
 			message: m.registries_delete_tags_selected_message(),
 			confirmLabel: m.common_delete(),
 			destructive: true,
 			run: (tag) => containerRegistryService.deleteTag(registry.id, repository, tag),
 			messages: {
-				success: (count) => m.registries_bulk_delete_tags_success({ count }),
+				success: () => m.registries_bulk_delete_tags_success({ count: selectedTags.length }),
 				partial: (success, total, failed) => m.common_bulk_delete_partial({ success, total, failed, resource: m.common_tags() }),
 				failure: () => m.registries_bulk_delete_tags_failed({ count: selectedTags.length })
 			},

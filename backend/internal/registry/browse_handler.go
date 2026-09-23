@@ -13,6 +13,7 @@ import (
 	"github.com/getarcaneapp/arcane/types/v2/containerregistry"
 )
 
+// ListRegistryRepositoriesInput is the input for listing the repositories of a registry.
 type ListRegistryRepositoriesInput struct {
 	ID     string `path:"id" doc:"Registry ID"`
 	Search string `query:"search" doc:"Search query"`
@@ -22,6 +23,7 @@ type ListRegistryRepositoriesInput struct {
 	Limit  int    `query:"limit" default:"20" doc:"Items per page"`
 }
 
+// ListRegistryTagsInput is the input for listing the tags of a registry repository.
 type ListRegistryTagsInput struct {
 	ID         string `path:"id" doc:"Registry ID"`
 	Repository string `query:"repository" required:"true" minLength:"1" doc:"Repository name"`
@@ -32,6 +34,7 @@ type ListRegistryTagsInput struct {
 	Limit      int    `query:"limit" default:"20" doc:"Items per page"`
 }
 
+// DeleteRegistryTagInput is the input for deleting a tag from a registry repository.
 type DeleteRegistryTagInput struct {
 	ID         string `path:"id" doc:"Registry ID"`
 	Repository string `query:"repository" required:"true" minLength:"1" doc:"Repository name"`

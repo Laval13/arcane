@@ -185,6 +185,9 @@ func (t *browseTargetInternal) repositoryInternal(repository string) (name.Repos
 	if repository == "" {
 		return name.Repository{}, common.Classify(common.ErrValidation, errors.New("repository is required"))
 	}
+	if t.prefix != "" && !strings.HasPrefix(repository, t.prefix+"/") {
+		return name.Repository{}, common.Classify(common.ErrValidation, errors.Errorf("repository %q is outside the registry namespace %q", repository, t.prefix))
+	}
 	repo, err := name.NewRepository(t.registry.RegistryStr()+"/"+repository, name.StrictValidation)
 	if err != nil {
 		return name.Repository{}, common.Classify(common.ErrValidation, errors.WrapIff(err, "invalid repository %q", repository))
@@ -205,18 +208,21 @@ func splitRegistryURLInternal(registryURL string) (host, prefix string) {
 	return host, strings.Trim(prefix, "/")
 }
 
+// loadTagDetailsInternal records per-tag failures on the tag itself so one
+// unreadable manifest does not hide the rest of the page.
 func (s *ContainerRegistryService) loadTagDetailsInternal(ctx context.Context, repo name.Repository, options []remote.Option, tags []containerregistry.RepositoryTag) {
-	group, groupCtx := errgroup.WithContext(ctx)
-	group.SetLimit(tagDetailsConcurrency)
+	var wg sync.WaitGroup
+	slots := make(chan struct{}, tagDetailsConcurrency)
 	for i := range tags {
-		group.Go(func() error {
-			if err := fillTagDetailsInternal(groupCtx, repo, options, &tags[i]); err != nil {
+		wg.Go(func() {
+			slots <- struct{}{}
+			defer func() { <-slots }()
+			if err := fillTagDetailsInternal(ctx, repo, options, &tags[i]); err != nil {
 				tags[i].Error = err.Error()
 			}
-			return nil
 		})
 	}
-	_ = group.Wait()
+	wg.Wait()
 }
 
 func fillTagDetailsInternal(ctx context.Context, repo name.Repository, options []remote.Option, tag *containerregistry.RepositoryTag) error {

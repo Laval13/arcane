@@ -39,7 +39,7 @@
 	let testingId = $state<string | null>(null);
 
 	const canDeleteRegistry = $derived(hasPermission('registries:delete'));
-	const canBrowseRegistry = $derived(hasPermission('registries:browse'));
+	const canBrowseRegistry = $derived(hasPermission('registries:read') && hasPermission('registries:browse'));
 
 	function maskAccessKeyId(keyId: string | undefined): string {
 		if (!keyId) return m.common_na();
@@ -261,12 +261,12 @@
 
 {#snippet RowActions({ item }: { item: ContainerRegistry })}
 	<RowActionsMenu>
-		<IfPermitted perm="registries:browse">
+		{#if canBrowseRegistry}
 			<DropdownMenu.Item onclick={() => goto(`/customize/registries/${item.id}`)}>
 				<FolderOpenIcon class="size-4" />
 				{m.registries_browse()}
 			</DropdownMenu.Item>
-		</IfPermitted>
+		{/if}
 
 		<IfPermitted perm="registries:test">
 			<DropdownMenu.Item onclick={() => handleTest(item.id, item.url)} disabled={testingId === item.id}>

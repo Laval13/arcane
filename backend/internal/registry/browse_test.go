@@ -101,11 +101,6 @@ func TestContainerRegistryService_ListRepositoriesInternal(t *testing.T) {
 	repositories, _, err = svc.ListRepositories(ctx, namespacedID, browseParamsInternal(""))
 	require.NoError(t, err)
 	assert.Equal(t, []string{"team/api", "team/web"}, repositoryNamesInternal(repositories))
-
-	_, _, err = svc.ListRepositoryTags(ctx, namespacedID, "other/tool", browseParamsInternal(""))
-	assert.ErrorIs(t, err, common.ErrValidation)
-	_, err = svc.DeleteRepositoryTag(ctx, namespacedID, "other/tool", "1.0")
-	assert.ErrorIs(t, err, common.ErrValidation)
 }
 
 func TestContainerRegistryService_ListRepositoryTagsSingleImageInternal(t *testing.T) {
@@ -204,9 +199,6 @@ func TestContainerRegistryService_DeleteRepositoryTagInternal(t *testing.T) {
 	require.Error(t, err)
 	_, err = remote.Head(mustParseReferenceInternal(t, host+"/team/api:2.0"))
 	require.NoError(t, err)
-
-	_, err = svc.DeleteRepositoryTag(ctx, id, "team/api", "missing")
-	assert.ErrorIs(t, err, common.ErrNotFound)
 }
 
 func TestContainerRegistryService_BrowseUsesStoredCredentialsInternal(t *testing.T) {
@@ -242,12 +234,67 @@ func TestContainerRegistryService_BrowseUsesStoredCredentialsInternal(t *testing
 	assert.ErrorIs(t, err, common.ErrBadRequest)
 }
 
-func TestContainerRegistryService_BrowseUnknownRegistryInternal(t *testing.T) {
+func TestContainerRegistryService_BrowseErrorsInternal(t *testing.T) {
+	host := newLabelTestRegistryInternal(t)
+	writeImageInternal(t, host+"/team/api:1.0", platformImageInternal(t, v1.Platform{OS: "linux", Architecture: "amd64"}, time.Now()))
+
 	db := setupContainerRegistryTestDBInternal(t)
 	svc := NewContainerRegistryService(db, nil, nil)
+	id := createBrowseTestRegistryInternal(t, db, host, "", "")
+	namespacedID := createBrowseTestRegistryInternal(t, db, "http://"+host+"/team/", "", "")
 
-	_, _, err := svc.ListRepositories(context.Background(), "missing", browseParamsInternal(""))
-	assert.ErrorIs(t, err, common.ErrNotFound)
+	tests := []struct {
+		name    string
+		call    func(ctx context.Context) error
+		wantErr error
+	}{
+		{
+			name: "unknown registry",
+			call: func(ctx context.Context) error {
+				_, _, err := svc.ListRepositories(ctx, "missing", browseParamsInternal(""))
+				return err
+			},
+			wantErr: common.ErrNotFound,
+		},
+		{
+			name: "empty repository",
+			call: func(ctx context.Context) error {
+				_, _, err := svc.ListRepositoryTags(ctx, id, " / ", browseParamsInternal(""))
+				return err
+			},
+			wantErr: common.ErrValidation,
+		},
+		{
+			name: "tags outside registry namespace",
+			call: func(ctx context.Context) error {
+				_, _, err := svc.ListRepositoryTags(ctx, namespacedID, "other/tool", browseParamsInternal(""))
+				return err
+			},
+			wantErr: common.ErrValidation,
+		},
+		{
+			name: "delete outside registry namespace",
+			call: func(ctx context.Context) error {
+				_, err := svc.DeleteRepositoryTag(ctx, namespacedID, "other/tool", "1.0")
+				return err
+			},
+			wantErr: common.ErrValidation,
+		},
+		{
+			name: "delete missing tag",
+			call: func(ctx context.Context) error {
+				_, err := svc.DeleteRepositoryTag(ctx, id, "team/api", "missing")
+				return err
+			},
+			wantErr: common.ErrNotFound,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.ErrorIs(t, tt.call(t.Context()), tt.wantErr)
+		})
+	}
 }
 
 func repositoryNamesInternal(repositories []containerregistry.Repository) []string {

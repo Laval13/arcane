@@ -18,13 +18,14 @@
 	import { bulkConfirmAndRun, confirmAndRun } from '#lib/utils/bulk-actions.js';
 	import { bytes, formatDateTimeShort } from '#lib/utils/formatting.js';
 	import { tryCatch } from '#lib/utils/try-catch.js';
+	import { buildImageReference } from '#lib/utils/registry.js';
 
 	let { data } = $props();
 
 	const registry = $derived(data.registry);
 	const repository = $derived(data.repository);
 	const registryLabel = $derived(registry.url || 'docker.io');
-	const registryHost = $derived(registryLabel.replace(/^https?:\/\//, '').split('/')[0]);
+	const registryHost = $derived(registryLabel.replace(/^https?:\/\//, '').split('/')[0] ?? registryLabel);
 	let tags = $derived(data.tags);
 	let requestOptions = $derived(data.requestOptions);
 	let selectedIds = $state<string[]>([]);
@@ -35,7 +36,7 @@
 	const canDeleteTags = $derived(hasPermission('registries:delete-tags'));
 
 	function tagReference(tag: string) {
-		return `${registryHost}/${repository}:${tag}`;
+		return buildImageReference(registryHost, repository, tag);
 	}
 
 	function platformLabel(platform: RegistryTag['platforms'][number]) {
@@ -146,13 +147,13 @@
 		},
 		{
 			accessorKey: 'digest',
-			title: m.registries_digest(),
+			title: m.images_attestations_digest(),
 			cell: DigestCell
 		},
 		{
 			id: 'platforms',
 			accessorFn: (row) => row.platforms.map(platformLabel).join(', '),
-			title: m.registries_platforms(),
+			title: m.platforms_label(),
 			cell: PlatformsCell
 		},
 		{
@@ -207,7 +208,7 @@
 		subtitle={(item) => (item.error ? m.registries_tag_details_unavailable() : shortDigest(item.digest))}
 		fields={[
 			{
-				label: m.registries_platforms(),
+				label: m.platforms_label(),
 				getValue: (item: RegistryTag) => item.platforms.map(platformLabel).join(', '),
 				icon: LayersIcon,
 				iconVariant: 'gray' as const,

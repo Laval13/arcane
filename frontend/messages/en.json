@@ -1943,8 +1943,6 @@
   "registries_open_repository": "Open Repository",
   "registries_open_repository_placeholder": "team/api",
   "registries_tags_load_failed": "Failed to load the tags of {repository}",
-  "registries_digest": "Digest",
-  "registries_platforms": "Platforms",
   "registries_tag_details_unavailable": "Details unavailable",
   "registries_copy_reference": "Copy image reference",
   "registries_delete_tag_title": "Delete Tag {tag}",

@@ -42,7 +42,7 @@ type DeleteRegistryTagInput struct {
 }
 
 func registerContainerRegistryBrowseInternal(api huma.API, h *ContainerRegistryHandler) {
-	huma.Register(api, huma.Operation{
+	middleware.RegisterWithPermission(api, huma.Operation{
 		OperationID: "listContainerRegistryRepositories",
 		Method:      "GET",
 		Path:        "/container-registries/{id}/repositories",
@@ -50,10 +50,9 @@ func registerContainerRegistryBrowseInternal(api huma.API, h *ContainerRegistryH
 		Description: "List the repositories stored in a container registry through its catalog API",
 		Tags:        []string{"Container Registries"},
 		Security:    handlerutil.DefaultOperationSecurity(),
-		Middlewares: middleware.RequirePermission(api, authz.PermRegistriesBrowse),
-	}, h.ListRepositories)
+	}, authz.PermRegistriesBrowse, h.ListRepositories)
 
-	huma.Register(api, huma.Operation{
+	middleware.RegisterWithPermission(api, huma.Operation{
 		OperationID: "listContainerRegistryTags",
 		Method:      "GET",
 		Path:        "/container-registries/{id}/tags",
@@ -61,10 +60,9 @@ func registerContainerRegistryBrowseInternal(api huma.API, h *ContainerRegistryH
 		Description: "List the tags of a registry repository with their manifest details",
 		Tags:        []string{"Container Registries"},
 		Security:    handlerutil.DefaultOperationSecurity(),
-		Middlewares: middleware.RequirePermission(api, authz.PermRegistriesBrowse),
-	}, h.ListTags)
+	}, authz.PermRegistriesBrowse, h.ListTags)
 
-	huma.Register(api, huma.Operation{
+	middleware.RegisterWithPermission(api, huma.Operation{
 		OperationID: "deleteContainerRegistryTag",
 		Method:      "DELETE",
 		Path:        "/container-registries/{id}/tags",
@@ -72,8 +70,7 @@ func registerContainerRegistryBrowseInternal(api huma.API, h *ContainerRegistryH
 		Description: "Delete the manifest a tag points to, which also removes every tag sharing its digest",
 		Tags:        []string{"Container Registries"},
 		Security:    handlerutil.DefaultOperationSecurity(),
-		Middlewares: middleware.RequirePermission(api, authz.PermRegistriesDeleteTags),
-	}, h.DeleteTag)
+	}, authz.PermRegistriesDeleteTags, h.DeleteTag)
 }
 
 // ListRepositories returns a paginated list of repositories stored in a registry.

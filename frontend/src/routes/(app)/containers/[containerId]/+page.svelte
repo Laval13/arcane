@@ -7,7 +7,7 @@
 	import ActionButtons from '#lib/components/action-buttons.svelte';
 	import { Badge } from '#lib/components/ui/badge/index.js';
 	import { bytes } from '#lib/utils/formatting.js';
-	import { tick } from 'svelte';
+	import { onMount, tick } from 'svelte';
 	import { page } from '$app/state';
 	import type { ContainerDetailsDto, ContainerNetworkSettings, ContainerStats as ContainerStatsType } from '#lib/types/docker.js';
 	import { m } from '#lib/paraglide/messages.js';
@@ -24,6 +24,7 @@
 	import ContainerShell from '../components/ContainerShell.svelte';
 	import ContainerComposePanel from '../components/ContainerComposePanel.svelte';
 	import ContainerInspect from '../components/ContainerInspect.svelte';
+	import ContainerProcesses from '../components/ContainerProcesses.svelte';
 	import ContainerDetailStatsSync from '../components/container-detail-stats-sync.svelte';
 	import ContainerHealthcheck from '../components/ContainerHealthcheck.svelte';
 	import ContainerCommitDialog from '../components/container-commit-dialog.svelte';
@@ -41,7 +42,8 @@
 		StatsIcon,
 		CodeIcon,
 		InspectIcon,
-		HealthIcon
+		HealthIcon,
+		LayoutListIcon
 	} from '#lib/icons/index.js';
 	import { parse as parseYaml } from 'yaml';
 	import type { IncludeFile } from '#lib/types/swarm.js';
@@ -51,10 +53,14 @@
 	import * as DropdownMenu from '#lib/components/ui/dropdown-menu/index.js';
 	import { EditIcon, ImagesIcon, PauseIcon, PlayIcon, ProjectsIcon, UpdateIcon, ZapIcon } from '#lib/icons/index.js';
 	import { runContainerLifecycleAction, confirmAndUpdateContainer } from '#lib/utils/container-actions.js';
-	import { imageService } from '#lib/services/image-service.js';
-	import { createQuery, useQueryClient } from '@tanstack/svelte-query';
+	import { useQueryClient } from '@tanstack/svelte-query';
 	import { queryKeys } from '#lib/query/query-keys.js';
-	import userStore from '#lib/stores/user-store.svelte.js';
+	import { activityStore } from '#lib/stores/activity.store.svelte.js';
+	import { createContainerUpdateActivityTracker } from '#lib/utils/container-update-activities.js';
+	import { APIError } from '#lib/services/api-service.js';
+	import { containerService } from '#lib/services/container-service.js';
+	import { extractApiErrorMessage } from '#lib/utils/api.js';
+	import { toast } from 'svelte-sonner';
 	import { isAutoUpdateLabelDisabled } from '#lib/utils/container-auto-update.js';
 	import KillContainerDialog from '../components/kill-container-dialog.svelte';
 	import { useUrlTab } from '#lib/hooks/use-url-tab.svelte.js';
@@ -168,35 +174,64 @@
 	let lifecycleStatus = $state<'pausing' | 'unpausing' | ''>('');
 	const isLifecycleActionPending = $derived(lifecycleStatus !== '');
 
-	const imageUpdateQuery = createQuery(() => {
-		const environmentId = environmentStore.selected?.id;
-		const image = container?.image;
-		userStore.current;
-		return {
-			queryKey: queryKeys.images.updateInfoByRef(environmentId ?? '', image ?? ''),
-			queryFn: async () => {
-				await environmentStore.ready;
-				return imageService.getUpdateInfoByRefs([image!]);
-			},
-			enabled: !!environmentId && !!image && hasPermission('containers:autoupdate', environmentId)
+	// The details response carries the stored check for this container's current
+	// policy; an older agent that omits it reports no status rather than "up to date".
+	const updateInfo = $derived(canUpdateContainer ? (container?.updateInfo ?? null) : null);
+	let updateLoading = $state(false);
+	let updateViewMounted = false;
+	const updateActivities = createContainerUpdateActivityTracker(
+		() => currentEnvId,
+		() => {
+			void refreshAfterUpdate();
+		},
+		() => container.id
+	);
+	onMount(() => {
+		updateViewMounted = true;
+		const unsubscribe = activityStore.subscribeActivities(updateActivities.observe);
+		return () => {
+			updateViewMounted = false;
+			unsubscribe();
 		};
 	});
-	const updateInfo = $derived.by(() => {
-		if (container?.image) return imageUpdateQuery.data?.[container.image] ?? null;
-		return null;
-	});
-	let updateLoading = $state(false);
+
+	async function refreshAfterUpdate() {
+		const environmentId = currentEnvId;
+		const containerId = container.id;
+		const result = await tryCatch(containerService.getContainerForEnvironment(environmentId, containerId));
+		if (!updateViewMounted || environmentId !== currentEnvId || containerId !== container.id) return;
+		if (result.error instanceof APIError && result.error.status === 404) {
+			await queryClient.invalidateQueries({ queryKey: ['containers', environmentId] });
+			if (!updateViewMounted || environmentId !== currentEnvId || containerId !== container.id) return;
+			await goto('/containers');
+			return;
+		}
+		if (result.error !== null) {
+			toast.error(m.common_refresh_failed({ resource: m.containers() }), {
+				description: extractApiErrorMessage(result.error)
+			});
+			return;
+		}
+		await Promise.all([
+			queryClient.invalidateQueries({ queryKey: ['containers', environmentId] }),
+			queryClient.invalidateQueries({ queryKey: queryKeys.containers.detail(environmentId, containerId) })
+		]);
+		if (updateViewMounted && environmentId === currentEnvId && containerId === container.id) await refreshAll();
+	}
 
 	function handleUpdateContainer() {
 		if (!container) return;
 		confirmAndUpdateContainer({
 			containerId: container.id,
 			containerName: containerDisplayName,
-			showPullingToast: true,
+			environmentId: currentEnvId,
 			setLoading: (loading) => {
 				updateLoading = loading;
 			},
-			onRefresh: () => refreshAll()
+			onRefresh: refreshAfterUpdate,
+			onAccepted: (activity) => {
+				if (updateViewMounted) updateActivities.accept(activity);
+			}
 		});
 	}
 
@@ -299,6 +334,7 @@
 	const tabItems = $derived<TabItem[]>([
 		{ value: 'overview', label: m.common_overview(), icon: ContainersIcon },
 		...(showStats ? [{ value: 'stats', label: m.containers_nav_metrics(), icon: StatsIcon }] : []),
+		{ value: 'processes', label: m.containers_processes_title(), icon: LayoutListIcon },
 		...(canViewLogs ? [{ value: 'logs', label: m.common_logs(), icon: FileTextIcon }] : []),
 		...(showShell ? [{ value: 'shell', label: m.common_shell(), icon: TerminalIcon }] : []),
 		...(hasHealthcheck ? [{ value: 'healthcheck', label: m.containers_nav_healthcheck(), icon: HealthIcon }] : []),
@@ -351,10 +387,7 @@
 			class="size-5"
 			containerClass="size-9"
 		/>
-		<h1
-			class="max-w-[10rem] min-w-0 truncate text-lg font-semibold sm:max-w-[14rem] md:max-w-[18rem] lg:max-w-[22rem]"
-			title={containerDisplayName}
-		>
+		<h1 class="max-w-40 min-w-0 truncate text-lg font-semibold sm:max-w-56 md:max-w-72 lg:max-w-88" title={containerDisplayName}>
 			{containerDisplayName}
 		</h1>
 		{#if container?.state}
@@ -367,11 +400,11 @@
 			<Badge variant="amber" minWidth="20">{m.sidebar_update_available()}</Badge>
 		{/if}
 		{#if project && composeInfo}
-			<a href="/projects/{project.id}" title={m.projects_title()}>
-				<Badge variant="gray" size="sm" class="max-w-40 truncate font-normal hover:text-foreground">
+			<Badge variant="gray" size="sm" href="/projects/{project.id}" title={m.projects_title()} class="max-w-40">
+				<span class="block min-w-0 truncate">
 					{composeInfo.projectName}
-				</Badge>
-			</a>
+				</span>
+			</Badge>
 		{/if}
 	</div>
 {/snippet}
@@ -539,6 +572,12 @@
 			{/if}
 		</Tabs.Content>
 	{/if}
+
+	<Tabs.Content value="processes" class="h-full">
+		{#if activeTab === 'processes'}
+			<ContainerProcesses containerId={container.id} status={containerStatus} />
+		{/if}
+	</Tabs.Content>
 
 	<Tabs.Content value="logs" class="h-full">
 		{#if activeTab === 'logs'}

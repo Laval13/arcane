@@ -1187,12 +1187,46 @@ func (s *ContainerService) GetContainerDetails(ctx context.Context, id string) (
 		excluded = dockerutils.ExcludedContainerNameSet(s.settingsService.GetStringSetting(ctx, "autoUpdateExcludedContainers", ""))
 	}
 	details.AutoUpdateEnabled = !labels.IsUpdateDisabled(details.Labels) && !dockerutils.ContainerNameExcluded([]string{details.Name}, excluded)
+	updates := s.lookupContainerUpdateInfoInternal(ctx, []container.Summary{{ID: details.ID, Image: details.Image, ImageID: details.ImageID, Labels: details.Labels}})
+	details.UpdateInfo = updates[details.ID]
 	s.applyContainerDetailsIconInternal(ctx, &details)
 
 	return details, nil
 }
 
 // GetContainerNameByReference resolves a container's clean name from a Docker ID or name.
+
+// containerProcessesPsArgs asks ps for per-process CPU and memory; Windows daemons ignore it.
+var containerProcessesPsArgs = []string{"-eo", "pid,user,%cpu,%mem,etime,cmd"}
+
+// GetContainerProcesses returns Docker's `top` snapshot for a container.
+func (s *ContainerService) GetContainerProcesses(ctx context.Context, containerID string) (containertypes.Processes, error) {
+	dockerClient, err := s.dockerService.GetClient(ctx)
+	if err != nil {
+		return containertypes.Processes{}, errors.WrapIf(err, "failed to connect to Docker")
+	}
+
+	timeout := timeouts.DefaultDockerAPI
+	if s.settingsService != nil {
+		timeout = timeouts.GetDuration(s.settingsService.GetSettingsConfig().DockerAPITimeout.AsInt(), timeouts.DefaultDockerAPI)
+	}
+	topCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	result, err := dockerClient.ContainerTop(topCtx, containerID, client.ContainerTopOptions{Arguments: containerProcessesPsArgs})
+	if err != nil {
+		return containertypes.Processes{}, errors.WrapIf(err, "failed to list container processes")
+	}
+	processes := containertypes.Processes{Titles: result.Titles, Processes: result.Processes}
+	if processes.Titles == nil {
+		processes.Titles = []string{}
+	}
+	if processes.Processes == nil {
+		processes.Processes = [][]string{}
+	}
+	return processes, nil
+}
+
 func (s *ContainerService) GetContainerNameByReference(ctx context.Context, ref string) (string, error) {
 	info, err := s.GetContainerByReference(ctx, ref)
 	if err != nil {
@@ -1424,7 +1458,7 @@ func (s *ContainerService) ListContainersPaginated(
 	}
 
 	dockerContainers = FilterExcludedContainers(dockerContainers, includeInternal, includeHidden)
-	updateInfoMap := s.getUpdateInfoMapInternal(ctx, dockerContainers)
+	updateInfoMap := s.lookupContainerUpdateInfoInternal(ctx, dockerContainers)
 	currentContainerID, currentContainerErr := cgroup.CurrentContainerID()
 	items := s.BuildSummaries(ctx, dockerContainers, updateInfoMap, currentContainerID, currentContainerErr)
 
@@ -1582,41 +1616,18 @@ func FilterExcludedContainers(containers []container.Summary, includeInternal, i
 	return filtered
 }
 
-func CollectImageIDs(containers []container.Summary) []string {
-	imageIDSet := make(map[string]struct{}, len(containers))
-	for _, dc := range containers {
-		if dc.ImageID != "" {
-			imageIDSet[dc.ImageID] = struct{}{}
-		}
-	}
-
-	imageIDs := make([]string, 0, len(imageIDSet))
-	for id := range imageIDSet {
-		imageIDs = append(imageIDs, id)
-	}
-	return imageIDs
-}
-
-func (s *ContainerService) getUpdateInfoMapInternal(ctx context.Context, containers []container.Summary) map[string]*imagetypes.UpdateInfo {
-	result := make(map[string]*imagetypes.UpdateInfo)
+// lookupContainerUpdateInfoInternal resolves stored update checks keyed by
+// container ID; lookup failures degrade to missing status rather than a failed list.
+func (s *ContainerService) lookupContainerUpdateInfoInternal(ctx context.Context, containers []container.Summary) map[string]*imagetypes.UpdateInfo {
 	if s.imageService == nil || len(containers) == 0 {
-		return result
+		return map[string]*imagetypes.UpdateInfo{}
 	}
-	updates, err := s.imageService.GetUpdateInfoByImageIDs(ctx, CollectImageIDs(containers))
+	updates, err := s.imageService.GetUpdateInfoByContainers(ctx, containers)
 	if err != nil {
-		slog.WarnContext(ctx, "Failed to fetch image update info for containers", "error", err)
-	} else {
-		maps.Copy(result, updates)
+		slog.WarnContext(ctx, "Failed to fetch container update info", "error", err)
+		return map[string]*imagetypes.UpdateInfo{}
 	}
-	scoped, err := s.imageService.GetUpdateInfoByContainers(ctx, containers)
-	if err != nil {
-		slog.WarnContext(ctx, "Failed to fetch container tag update info", "error", err)
-		return result
-	}
-	for id, info := range scoped {
-		result["container::"+id] = info
-	}
-	return result
+	return updates
 }
 
 func (s *ContainerService) BuildSummaries(ctx context.Context, containers []container.Summary, updateInfoMap map[string]*imagetypes.UpdateInfo, currentContainerID string, currentContainerErr error) []containertypes.Summary {
@@ -1627,7 +1638,6 @@ func (s *ContainerService) BuildSummaries(ctx context.Context, containers []cont
 	}
 	for _, dc := range containers {
 		summary := containertypes.NewSummary(dc)
-		key := dc.ImageID
 		policy := updater.DefaultLabelPolicy().TagPolicy(dc.Labels)
 		resolved, policyErr := tagpolicy.Resolve(dc.Image, policy)
 		summary.UpdateStrategy = resolved.Strategy
@@ -1637,12 +1647,7 @@ func (s *ContainerService) BuildSummaries(ctx context.Context, containers []cont
 				summary.UpdateStrategy = "auto"
 			}
 		}
-		if policyErr != nil || resolved.Strategy == "tag" {
-			key = "container::" + dc.ID
-		}
-		if info, exists := updateInfoMap[key]; exists {
-			summary.UpdateInfo = info
-		}
+		summary.UpdateInfo = updateInfoMap[dc.ID]
 		summary.RedeployDisabled = labels.ShouldDisableArcaneServerRedeploy(summary.Labels, summary.ID, currentContainerID, currentContainerErr)
 		summary.AutoUpdateEnabled = !labels.IsUpdateDisabled(dc.Labels) && !dockerutils.ContainerNameExcluded(dc.Names, excluded)
 		summary.Hidden, _ = utils.ParseBool(dc.Labels[libarcane.HiddenResourceLabel])

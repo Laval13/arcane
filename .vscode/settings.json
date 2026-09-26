@@ -25,5 +25,16 @@
   "js/ts.tsdk.path": "node_modules/@typescript/native-preview",
   "yaml.schemas": {
     "https://json.schemastore.org/github-workflow.json": ".github/workflows/*"
+  },
+  "editor.defaultFormatter": "oxc.oxc-vscode",
+  "oxc.disableNestedConfig": true,
+  "oxc.fmt.disableNestedConfig": true,
+  "editor.formatOnSave": true,
+  "editor.formatOnSaveMode": "file",
+  "editor.codeActionsOnSave": {
+    "source.fixAll.oxc": "explicit"
+  },
+  "[jsonc]": {
+    "editor.defaultFormatter": "oxc.oxc-vscode"
   }
 }

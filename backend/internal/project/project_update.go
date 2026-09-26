@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"bytes"
 	"fmt"
@@ -265,27 +266,28 @@ func (s *ProjectService) refreshProjectAfterContentUpdateInternal(ctx context.Co
 	}
 }
 
-func (s *ProjectService) ApplyGitSyncProjectFiles(ctx context.Context, projectID string, composeContent string, gitEnvContent *string, gitOverrideContent *string, gitOverrideFileName string, user common.User) (*Project, error) {
+func (s *ProjectService) ApplyGitSyncProjectFiles(ctx context.Context, projectID string, composeContent string, gitEnvContent *string, gitOverrideContent *string, gitOverrideFileName string, user common.User) (*Project, bool, error) {
 	proj, projectsDirectory, err := s.getProjectForUpdate(ctx, projectID)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if err := ensureProjectMutableInternal(&proj); err != nil {
-		return nil, err
+		return nil, false, err
 	}
+	before := s.readGitSyncProjectContentInternal(ctx, proj.ID)
 
 	envUpdate, err := s.prepareGitSyncEnvUpdateInternal(proj.Path, gitEnvContent)
 	if err != nil {
-		return nil, errors.WrapIf(err, "failed to resolve git env state")
+		return nil, false, errors.WrapIf(err, "failed to resolve git env state")
 	}
 
 	if err := projects.ValidateComposeContentForUpdate(ctx, projectsDirectory, proj.Path, proj.Name, composeContent, envUpdate.effectiveContent, gitOverrideContent, gitOverrideFileName, true); err != nil {
-		return nil, errors.WrapIf(err, "invalid compose file")
+		return nil, false, errors.WrapIf(err, "invalid compose file")
 	}
 
 	backup, cleanupBackup, err := s.prepareProjectUpdateBackupInternal(ctx, projectsDirectory, proj.Path, &composeContent, gitEnvContent, gitOverrideContent)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer cleanupBackup()
 
@@ -295,7 +297,7 @@ func (s *ProjectService) ApplyGitSyncProjectFiles(ctx context.Context, projectID
 		// A failure after the env persist would otherwise leave the project with
 		// new env values and an old or partially updated compose file set.
 		err = s.handleProjectUpdateFailureInternal(ctx, projectID, projectsDirectory, &proj, backup, &journalActive, projectStateCommitted, err)
-		return nil, err
+		return nil, false, err
 	}
 
 	s.refreshComposeProjectNameInternal(ctx, &proj)
@@ -309,20 +311,54 @@ func (s *ProjectService) ApplyGitSyncProjectFiles(ctx context.Context, projectID
 		slog.WarnContext(ctx, "failed to update service counts after git sync", "projectID", proj.ID, "error", err)
 	}
 
+	after := s.readGitSyncProjectContentInternal(ctx, proj.ID)
+	envSourceRemoved := gitEnvContent == nil && envUpdate.state.HasGitSource
+	changed := s.logGitSyncProjectUpdateInternal(ctx, &proj, before, after, envSourceRemoved, user)
+
+	return &proj, changed, nil
+}
+
+// gitSyncProjectContentInternal is the effective content compared before and
+// after a git sync apply. Unreadable snapshots always compare as changed.
+type gitSyncProjectContentInternal struct {
+	compose, env, override string
+	unreadable             bool
+}
+
+func (s *ProjectService) readGitSyncProjectContentInternal(ctx context.Context, projectID string) gitSyncProjectContentInternal {
+	compose, env, override, err := s.GetProjectContent(ctx, projectID)
+	if err != nil {
+		slog.WarnContext(ctx, "failed to read project content for git sync change detection; treating as changed", "projectID", projectID, "error", err)
+		return gitSyncProjectContentInternal{unreadable: true}
+	}
+	return gitSyncProjectContentInternal{compose: compose, env: env, override: override}
+}
+
+// logGitSyncProjectUpdateInternal logs project.update when the effective content
+// changed or the Git env source was removed, and reports whether content changed.
+func (s *ProjectService) logGitSyncProjectUpdateInternal(ctx context.Context, proj *Project, before, after gitSyncProjectContentInternal, envSourceRemoved bool, user common.User) bool {
+	unreadable := before.unreadable || after.unreadable
+	composeChanged := unreadable || before.compose != after.compose
+	envChanged := unreadable || projects.EnvContentChanged(before.env, after.env)
+	overrideChanged := unreadable || before.override != after.override
+	contentChanged := composeChanged || envChanged || overrideChanged
+	if !contentChanged && !envSourceRemoved {
+		return false
+	}
+
 	metadata := database.JSON{
 		"action":          "git_sync_update",
 		"projectID":       proj.ID,
 		"projectName":     proj.Name,
-		"composeUpdated":  true,
-		"envUpdated":      gitEnvContent != nil,
-		"overrideUpdated": gitOverrideContent != nil,
+		"composeUpdated":  composeChanged,
+		"envUpdated":      envChanged,
+		"overrideUpdated": overrideChanged,
 	}
-	if gitEnvContent == nil {
+	if envSourceRemoved {
 		metadata["envSourceRemoved"] = true
 	}
 	s.logProjectEventInternal(ctx, event.EventTypeProjectUpdate, proj.ID, proj.Name, user, metadata, "could not log git sync project update action")
-
-	return &proj, nil
+	return contentChanged
 }
 
 // applyGitSyncProjectFilesInternal persists the synced env, compose, and
@@ -1093,6 +1129,8 @@ func prepareProjectServiceImagesInternal(source []byte, effective *composetypes.
 		return nil, nil, errors.New("Compose source has no services mapping")
 	}
 	serviceNames := make([]string, 0, len(changes))
+	// Rewrite image scalars in place; re-encoding the node tree drops blank lines and operator formatting.
+	edits := make([]composeImageEditInternal, 0, len(changes))
 	for name, change := range changes {
 		service, ok := effective.Services[name]
 		if !ok {
@@ -1116,20 +1154,21 @@ func prepareProjectServiceImagesInternal(source []byte, effective *composetypes.
 		if !strings.Contains(imageNode.Value, "$") && refs.NormalizeImageUpdateRef(imageNode.Value) != expected && refs.NormalizeImageUpdateRef(imageNode.Value) != target {
 			return nil, nil, fmt.Errorf("service %s source image changed since Compose was loaded", name)
 		}
-		imageNode.Value = change.TargetRef
+		edit, err := composeImageSourceEditInternal(source, imageNode, change.TargetRef)
+		if err != nil {
+			return nil, nil, fmt.Errorf("service %s: %w", name, err)
+		}
+		edits = append(edits, edit)
 		serviceNames = append(serviceNames, name)
 	}
 	slices.Sort(serviceNames)
-	var output bytes.Buffer
-	encoder := yaml.NewEncoder(&output)
-	encoder.SetIndent(2)
-	if err := encoder.Encode(&document); err != nil {
-		return nil, nil, fmt.Errorf("encode updated Compose source: %w", err)
+	// Splice from the end so earlier spans keep their offsets; distinct scalars never overlap.
+	slices.SortFunc(edits, func(a, b composeImageEditInternal) int { return b.start - a.start })
+	updated := slices.Clone(source)
+	for _, edit := range edits {
+		updated = slices.Concat(updated[:edit.start], edit.text, updated[edit.end:])
 	}
-	if err := encoder.Close(); err != nil {
-		return nil, nil, fmt.Errorf("close updated Compose encoder: %w", err)
-	}
-	return output.Bytes(), serviceNames, nil
+	return updated, serviceNames, nil
 }
 
 func validateImageUpdateSourceInternal(node *yaml.Node) error {
@@ -1161,6 +1200,52 @@ func composeImageFieldInternal(node *yaml.Node, key string) *yaml.Node {
 		}
 	}
 	return nil
+}
+
+// composeImageEditInternal is an image scalar's source byte span and its replacement text.
+type composeImageEditInternal struct {
+	start, end int
+	text       []byte
+}
+
+// composeImageSourceEditInternal finds an image scalar's single-line source span using YAML's line-break rules
+// and renders the target in the scalar's original style.
+func composeImageSourceEditInternal(source []byte, node *yaml.Node, target string) (composeImageEditInternal, error) {
+	const lineBreaks = "\r\n\u0085\u2028\u2029"
+	edit := composeImageEditInternal{start: len(source) - len(bytes.TrimPrefix(source, []byte("\xEF\xBB\xBF")))}
+	for line, column := 1, 1; line < node.Line || (line == node.Line && column < node.Column); column++ {
+		if edit.start >= len(source) {
+			return edit, errors.New("image scalar position is outside the Compose source")
+		}
+		r, size := utf8.DecodeRune(source[edit.start:])
+		edit.start += size
+		if r == '\r' && bytes.HasPrefix(source[edit.start:], []byte("\n")) {
+			edit.start++
+		}
+		if strings.ContainsRune(lineBreaks, r) {
+			line, column = line+1, 0
+		}
+	}
+	// The shortest same-line span that decodes to the parsed value is the scalar's source text, including tags and escapes.
+	found := false
+	for edit.end = edit.start; !found && edit.end < len(source); {
+		r, size := utf8.DecodeRune(source[edit.end:])
+		if strings.ContainsRune(lineBreaks, r) {
+			break
+		}
+		edit.end += size
+		var decoded string
+		found = yaml.Unmarshal(source[edit.start:edit.end], &decoded) == nil && decoded == node.Value
+	}
+	if !found {
+		return edit, errors.New("tag updates require a single-line image scalar")
+	}
+	text, err := yaml.Marshal(&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Style: node.Style, Value: target})
+	edit.text = bytes.TrimSuffix(text, []byte("\n"))
+	if err != nil || bytes.ContainsAny(edit.text, "\r\n") {
+		return edit, fmt.Errorf("image %s cannot be written as a single-line scalar", target)
+	}
+	return edit, nil
 }
 
 func persistProjectServiceImagesInternal(ctx context.Context, projectPath, logical string, original, updated []byte) error {

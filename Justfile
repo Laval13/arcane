@@ -1077,16 +1077,16 @@ _utils-list-feats:
             -f owner=getarcaneapp \
             -f name=arcane \
             -F endCursor=null \
-            -f query='query($owner: String!, $name: String!, $endCursor: String) { repository(owner: $owner, name: $name) { discussions(first: 100, after: $endCursor) { nodes { number title url category { slug } isAnswered upvoteCount reactionGroups { content users { totalCount } } } pageInfo { hasNextPage endCursor } } } }' \
+            -f query='query($owner: String!, $name: String!, $endCursor: String) { repository(owner: $owner, name: $name) { discussions(first: 100, after: $endCursor, states: [OPEN]) { nodes { number title url category { slug } isAnswered upvoteCount reactionGroups { content users { totalCount } } } pageInfo { hasNextPage endCursor } } } }' \
         | jq -r 'map(.data.repository.discussions.nodes[] | select(.category.slug == "feature-requests") | . + {upvotes: (.upvoteCount + ([.reactionGroups[]? | select(.content == "THUMBS_UP") | .users.totalCount] | add // 0))}) | sort_by(.upvotes, .number) | reverse | .[] | [.upvotes, .number, (if .isAnswered then "answered" else "open" end), .title, .url] | @tsv'
     )
 
     if [ -z "$discussions" ]; then
-        echo "No Feature discussions found."
+        echo "No open feature request discussions found."
         exit 0
     fi
 
-    echo "Feature discussions by votes (upvotes + 👍):"
+    echo "Open feature request discussions by votes (upvotes + 👍):"
     echo ""
 
     while IFS=$'\t' read -r votes number status title url; do

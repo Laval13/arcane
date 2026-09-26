@@ -25,6 +25,9 @@
 	import ImageUpdateItem from '#lib/components/image-update-item.svelte';
 	import { PersistedState } from 'runed';
 	import { onMount } from 'svelte';
+	import { useQueryClient } from '@tanstack/svelte-query';
+	import { activityStore } from '#lib/stores/activity.store.svelte.js';
+	import { createContainerUpdateActivityTracker } from '#lib/utils/container-update-activities.js';
 	import { mode } from 'mode-watcher';
 	import { ContainerStatsManager } from './components/container-stats-manager.svelte';
 	import ContainerStatsSync from './components/container-stats-sync.svelte';
@@ -101,6 +104,17 @@
 	});
 
 	const statsManager = new ContainerStatsManager();
+	const queryClient = useQueryClient();
+	let updateTableMounted = false;
+	const updateActivities = createContainerUpdateActivityTracker(
+		() => environmentId,
+		() => {
+			if (!updateTableMounted || environmentId !== environmentStore.selected?.id) return;
+			void queryClient.invalidateQueries({ queryKey: ['containers', environmentId] });
+			void queryClient.invalidateQueries({ queryKey: ['container', environmentId] });
+			void refreshContainers(requestOptions);
+		}
+	);
 
 	const resourceSortSupported = $derived(containers.resourceSortSupported === true);
 	const resourceSortActive = $derived.by(() => {
@@ -203,7 +217,12 @@
 		},
 		refreshContainers: () => refreshContainers(requestOptions),
 		actionStatus,
-		isBulkLoading
+		isBulkLoading,
+		environmentId: () => environmentId,
+		onUpdateAccepted: (activity) => {
+			if (updateTableMounted) updateActivities.accept(activity);
+		},
+		canRefreshUpdates: () => updateTableMounted && environmentId === environmentStore.selected?.id
 	});
 
 	const isAnyLoading = $derived(hasAnyLoadingState(actionStatus, isBulkLoading));
@@ -303,6 +322,8 @@
 	}
 
 	onMount(() => {
+		updateTableMounted = true;
+		const unsubscribeActivities = activityStore.subscribeActivities(updateActivities.observe);
 		collapsedGroupsState = new PersistedState<Record<string, boolean>>('container-groups-collapsed', {});
 
 		const persistedInternal = (customSettings['showInternalContainers'] as boolean) ?? false;
@@ -325,6 +346,8 @@
 		}
 
 		return () => {
+			updateTableMounted = false;
+			unsubscribeActivities();
 			statsManager.destroy();
 		};
 	});
@@ -627,11 +650,13 @@
 		<IconImage src={iconUrl} alt={displayName} fallback={BoxIcon} class="size-6" containerClass="size-8" />
 		<a class="font-medium hover:underline" href="/containers/{item.id}">{displayName}</a>
 		{#if item.hidden}
-			<Badge variant="gray" size="sm" class="font-normal text-muted-foreground">{m.hidden()}</Badge>
+			<Badge variant="gray" size="sm">{m.hidden()}</Badge>
 		{/if}
 		{#if projectLabel && !groupByProject}
-			<Badge variant="gray" size="sm" class="max-w-40 truncate font-normal text-muted-foreground" title={projectLabel}>
-				{projectLabel}
+			<Badge variant="gray" size="sm" class="max-w-40" title={projectLabel}>
+				<span class="block min-w-0 truncate">
+					{projectLabel}
+				</span>
 			</Badge>
 		{/if}
 	</div>
@@ -660,7 +685,7 @@
 					action="base"
 					tone="outline"
 					size="sm"
-					class="size-7 border-transparent bg-transparent p-0 text-green-600 shadow-none hover:bg-green-600/10 hover:text-green-500"
+					class="size-7 border-transparent bg-transparent p-0 text-success shadow-none hover:bg-success/10 hover:text-success"
 					onclick={() => performContainerAction('start', item.id)}
 					disabled={!resourcesCurrent || isAnyLoading}
 					icon={StartIcon}
@@ -671,7 +696,7 @@
 					action="base"
 					tone="outline"
 					size="sm"
-					class="size-7 border-transparent bg-transparent p-0 text-red-600 shadow-none hover:bg-red-600/10 hover:text-red-500"
+					class="size-7 border-transparent bg-transparent p-0 text-destructive shadow-none hover:bg-destructive/10 hover:text-destructive"
 					onclick={() => performContainerAction('stop', item.id)}
 					disabled={!resourcesCurrent || isAnyLoading}
 					title={m.common_stop()}
@@ -835,11 +860,11 @@
 			<div class="flex flex-row gap-4 border-t pt-3">
 				{#if (mobileFieldVisibility['ports'] ?? true) && item.ports && item.ports.length > 0}
 					<div class="flex min-w-0 flex-1 items-start gap-2.5">
-						<div class="flex size-7 shrink-0 items-center justify-center rounded-lg bg-sky-500/10">
-							<NetworksIcon class="size-3.5 text-sky-500" />
+						<div class="flex size-7 shrink-0 items-center justify-center rounded-lg bg-info/10">
+							<NetworksIcon class="size-3.5 text-info" />
 						</div>
 						<div class="min-w-0 flex-1">
-							<div class="text-[10px] font-medium tracking-wide text-muted-foreground uppercase">
+							<div class="text-3xs font-medium tracking-wide text-muted-foreground uppercase">
 								{m.common_ports()}
 							</div>
 							<div class="mt-1">
@@ -851,7 +876,7 @@
 				{#if mobileFieldVisibility['updates'] ?? true}
 					<div class="flex min-w-0 flex-1 items-start gap-2.5">
 						<div class="flex min-w-0 flex-col">
-							<div class="text-[10px] font-medium tracking-wide text-muted-foreground uppercase">
+							<div class="text-3xs font-medium tracking-wide text-muted-foreground uppercase">
 								{m.updates()}
 							</div>
 							<div class="mt-1">

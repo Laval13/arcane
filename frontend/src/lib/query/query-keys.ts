@@ -116,7 +116,8 @@ export const queryKeys = {
 		create: (environmentId: string) => ['containers', 'create', environmentId] as const,
 		statusCounts: (environmentId: string) => ['containers', 'status-counts', environmentId] as const,
 		detail: (environmentId: string, containerId: string) => ['container', environmentId, containerId] as const,
-		editConfig: (environmentId: string, containerId: string) => ['container', environmentId, containerId, 'edit-config'] as const
+		editConfig: (environmentId: string, containerId: string) => ['container', environmentId, containerId, 'edit-config'] as const,
+		processes: (environmentId: string, containerId: string) => ['container', environmentId, containerId, 'processes'] as const
 	},
 	images: {
 		all: ['images'] as const,
@@ -125,7 +126,6 @@ export const queryKeys = {
 		usageCounts: (environmentId: string) => ['images', 'usage-counts', environmentId] as const,
 		history: (environmentId: string, imageId: string) => ['image', environmentId, imageId, 'history'] as const,
 		detail: (environmentId: string, imageId: string) => ['image', environmentId, imageId] as const,
-		updateInfoByRef: (environmentId: string, imageRef: string) => ['image-update-info', environmentId, imageRef] as const,
 		updateCheck: (environmentId: string, imageId: string) => ['image-update', environmentId, imageId] as const,
 		builds: (environmentId: string) => ['images', environmentId, 'builds'] as const,
 		buildsList: (environmentId: string, options: SearchPaginationSortRequest) =>
@@ -185,7 +185,7 @@ export const queryKeys = {
 			['volume-backups', environmentId, volumeName, backupId, 'has-path', path] as const
 	},
 	vulnerabilities: {
-		summaryByEnvironment: (environmentId: string) => ['vulnerabilities', 'summary', environmentId] as const,
+		overviewByEnvironment: (environmentId: string) => ['vulnerabilities', 'overview', environmentId] as const,
 		scanResult: (environmentId: string, imageId: string) => ['vulnerabilities', 'scan-result', environmentId, imageId] as const,
 		allByEnvironment: (environmentId: string, request: SearchPaginationSortRequest) =>
 			['vulnerabilities', 'all', environmentId, stableSerialize(request)] as const,

@@ -313,6 +313,8 @@ export interface ContainerDetailsDto {
 	redeployDisabled?: boolean;
 	/** Eligibility under the updater label and exclusion setting; absent on older agents. */
 	autoUpdateEnabled?: boolean;
+	/** Stored update check for the container's current policy; absent on older agents. */
+	updateInfo?: ImageUpdateInfoDto;
 }
 
 export interface ContainerCommitRequest {
@@ -1088,4 +1090,9 @@ export interface ContainerRegistryPullUsage {
 	source?: string;
 	checkedAt: string;
 	error?: string;
+}
+
+export interface ContainerProcessesDto {
+	titles: string[];
+	processes: string[][];
 }

@@ -11,6 +11,8 @@
 	import { Label } from '#lib/components/ui/label/index.js';
 	import * as Select from '#lib/components/ui/select/index.js';
 	import * as Collapsible from '#lib/components/ui/collapsible/index.js';
+	import * as InputGroup from '#lib/components/ui/input-group/index.js';
+	import EmptyState from '#lib/components/states/empty-state.svelte';
 	import SwitchWithLabel from '#lib/components/form/labeled-switch.svelte';
 	import IconImage from '#lib/components/icon-image.svelte';
 	import {
@@ -20,7 +22,9 @@
 		ProjectsIcon,
 		DownloadIcon,
 		SettingsIcon,
-		FileTextIcon
+		FileTextIcon,
+		SearchIcon,
+		CloseIcon
 	} from '#lib/icons/index.js';
 
 	import { toast } from 'svelte-sonner';
@@ -41,6 +45,8 @@
 	const loadingStates = new SvelteSet<string>();
 	let sortBy = $state<'name-asc' | 'name-desc'>('name-asc');
 	let groupByRegistry = $state(true);
+	let searchQuery = $state('');
+	let searchInput = $state<HTMLInputElement | null>(null);
 	const selectTemplateMutation = createMutation(() => ({
 		mutationFn: (template: Template) => templateService.getTemplateContent(template.id)
 	}));
@@ -49,9 +55,20 @@
 	}));
 
 	const allTemplates = $derived(templates ?? []);
+	const normalizedQuery = $derived(searchQuery.trim().toLowerCase());
+
+	// Case-insensitive substring match against name, description, tags and registry label.
+	const filteredTemplates = $derived.by(() => {
+		if (!normalizedQuery) return allTemplates;
+		return allTemplates.filter((template) =>
+			[template.name, template.description ?? '', registryLabel(template), ...normalizeTags(template.metadata?.tags)].some(
+				(field) => field.toLowerCase().includes(normalizedQuery)
+			)
+		);
+	});
 
 	const sortedTemplates = $derived.by(() => {
-		const sorted = [...allTemplates];
+		const sorted = [...filteredTemplates];
 		sorted.sort((a, b) => (sortBy === 'name-asc' ? a.name.localeCompare(b.name) : b.name.localeCompare(a.name)));
 		return sorted;
 	});
@@ -61,7 +78,7 @@
 
 		const groups = new Map<string, Template[]>();
 		for (const template of sortedTemplates) {
-			const key = template.registry?.name ?? (template.isRemote ? m.templates_remote() : m.local());
+			const key = registryLabel(template);
 			const items = groups.get(key) ?? [];
 			items.push(template);
 			groups.set(key, items);
@@ -76,6 +93,21 @@
 		'name-asc': m.templates_sort_name_asc(),
 		'name-desc': m.templates_sort_name_desc()
 	};
+
+	function registryLabel(template: Template): string {
+		return template.registry?.name ?? (template.isRemote ? m.templates_remote() : m.local());
+	}
+
+	function clearSearch() {
+		searchQuery = '';
+		searchInput?.focus();
+	}
+
+	// The dialog stays mounted while closed, so drop the query rather than showing stale results on reopen.
+	function closeDialog() {
+		searchQuery = '';
+		open = false;
+	}
 
 	function normalizeTags(tags: unknown): string[] {
 		if (!tags || tags === null || tags === undefined) return [];
@@ -126,7 +158,7 @@
 						content: details.content,
 						envContent: details.envContent
 					});
-					open = false;
+					closeDialog();
 					toast.success(m.templates_loaded_success({ name: template.name }));
 				})()
 			);
@@ -172,7 +204,7 @@
 </script>
 
 {#snippet templateCard(template: Template, showRegistry: boolean = false)}
-	<Card class="border transition-colors hover:border-primary/20 hover:bg-muted/50">
+	<Card interactive>
 		<div class="p-4">
 			<div class="mb-2 flex items-start justify-between gap-2">
 				<div class="flex min-w-0 items-start gap-3">
@@ -187,10 +219,10 @@
 				</div>
 				<div class="ml-2 flex flex-shrink-0 flex-wrap items-center gap-1">
 					{#if template.metadata?.version}
-						<Badge variant="outline" class="text-xs">v{template.metadata.version}</Badge>
+						<Badge variant="outline">v{template.metadata.version}</Badge>
 					{/if}
 					{#if template.metadata?.envUrl || template.envContent}
-						<Badge variant="secondary" class="text-xs">
+						<Badge variant="secondary">
 							<SettingsIcon class="mr-1 size-3" />
 							ENV
 						</Badge>
@@ -200,13 +232,13 @@
 
 			{#if showRegistry}
 				<div class="mb-2">
-					<Badge variant="secondary" class="text-xs">
+					<Badge variant="secondary">
 						{#if template.isRemote}
 							<RegistryIcon class="size-3" />
 						{:else}
 							<ProjectsIcon class="size-3" />
 						{/if}
-						{template.registry?.name ?? (template.isRemote ? m.templates_remote() : m.local())}
+						{registryLabel(template)}
 					</Badge>
 				</div>
 			{/if}
@@ -257,14 +289,52 @@
 	</Card>
 {/snippet}
 
+{#snippet groupGrid(items: Template[])}
+	<div class="px-6 pb-6">
+		<div class="grid grid-cols-1 gap-4 md:grid-cols-2">
+			{#each items as template (template.id)}
+				{@render templateCard(template)}
+			{/each}
+		</div>
+	</div>
+{/snippet}
+
 <ResponsiveDialog
 	bind:open
 	title={m.templates_choose_title()}
 	description={m.templates_choose_description()}
-	contentClass="sm:max-w-[900px]"
+	contentClass="sm:max-w-225"
+	onOpenChange={(next) => {
+		if (!next) searchQuery = '';
+	}}
 >
 	{#snippet children()}
 		<div class="space-y-4">
+			<InputGroup.Root>
+				<InputGroup.Addon>
+					<SearchIcon aria-hidden="true" />
+				</InputGroup.Addon>
+				<InputGroup.Input
+					type="text"
+					placeholder={m.templates_search_placeholder()}
+					aria-label={m.common_search()}
+					bind:value={searchQuery}
+					bind:ref={searchInput}
+				/>
+				{#if searchQuery}
+					<InputGroup.Addon align="inline-end">
+						<InputGroup.Button
+							size="icon-xs"
+							onclick={clearSearch}
+							title={m.common_clear_search()}
+							aria-label={m.common_clear_search()}
+						>
+							<CloseIcon class="size-4" />
+						</InputGroup.Button>
+					</InputGroup.Addon>
+				{/if}
+			</InputGroup.Root>
+
 			<div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
 				<div class="flex items-center gap-3">
 					<SwitchWithLabel
@@ -275,9 +345,9 @@
 					/>
 				</div>
 				<div class="flex items-center gap-3">
-					<Label for="sortBy" class="text-sm font-medium whitespace-nowrap">{m.common_sort_by()}</Label>
+					<Label for="sortBy" class="whitespace-nowrap">{m.common_sort_by()}</Label>
 					<Select.Root bind:value={sortBy} type="single">
-						<Select.Trigger id="sortBy" class="h-9 rounded-md border bg-background px-2 text-sm">
+						<Select.Trigger id="sortBy" class="h-9">
 							{filters[sortBy]}
 						</Select.Trigger>
 						<Select.Content>
@@ -289,7 +359,7 @@
 				</div>
 			</div>
 
-			<ScrollArea class="max-h-[65vh]">
+			<ScrollArea class="max-h-(--max-height-screen-70)">
 				{#if allTemplates.length === 0}
 					<div class="py-10 text-center text-muted-foreground">
 						<FileTextIcon class="mx-auto mb-4 size-12 opacity-50" />
@@ -300,30 +370,47 @@
 							{m.templates_add_registry_prompt_part2()}
 						</p>
 					</div>
-				{:else if groupByRegistry && groupedTemplates.length > 0}
+				{:else if filteredTemplates.length === 0}
+					<EmptyState
+						icon={SearchIcon}
+						title={m.common_no_results_found()}
+						description={m.common_no_results_hint()}
+						actionLabel={m.common_clear_search()}
+						onAction={clearSearch}
+					/>
+				{:else if groupByRegistry}
 					<div class="space-y-3">
 						{#each groupedTemplates as group (group.name)}
-							<Collapsible.Root class="w-full">
-								<Card class="border-2">
-									<Collapsible.Trigger class="flex w-full items-center justify-between px-4 py-3 text-left">
-										<div class="flex items-center gap-2">
-											<ArrowDownIcon class="hidden size-4 data-[state=open]:block" />
-											<ArrowRightIcon class="block size-4 data-[state=open]:hidden" />
-											<span class="font-semibold">{group.name}</span>
-											<Badge variant="secondary" class="ml-2">{group.items.length}</Badge>
-										</div>
-									</Collapsible.Trigger>
-									<Collapsible.Content>
-										<div class="px-6 pb-6">
-											<div class="grid grid-cols-1 gap-4 md:grid-cols-2">
-												{#each group.items as template (template.id)}
-													{@render templateCard(template)}
-												{/each}
-											</div>
-										</div>
-									</Collapsible.Content>
+							{#if normalizedQuery}
+								<!-- Static headings while searching so matches are never hidden in a collapsed group. -->
+								<Card>
+									<div class="flex items-center gap-2 px-4 py-3">
+										<span class="font-semibold">{group.name}</span>
+										<Badge variant="secondary" class="ml-2">{group.items.length}</Badge>
+									</div>
+									{@render groupGrid(group.items)}
 								</Card>
-							</Collapsible.Root>
+							{:else}
+								<Collapsible.Root class="w-full">
+									<Card>
+										<Collapsible.Trigger>
+											{#snippet child({ props })}
+												<button {...props} type="button" class="flex w-full items-center justify-between px-4 py-3 text-left">
+													<div class="flex items-center gap-2">
+														<ArrowDownIcon class="hidden size-4 data-[state=open]:block" />
+														<ArrowRightIcon class="block size-4 data-[state=open]:hidden" />
+														<span class="font-semibold">{group.name}</span>
+														<Badge variant="secondary" class="ml-2">{group.items.length}</Badge>
+													</div>
+												</button>
+											{/snippet}
+										</Collapsible.Trigger>
+										<Collapsible.Content>
+											{@render groupGrid(group.items)}
+										</Collapsible.Content>
+									</Card>
+								</Collapsible.Root>
+							{/if}
 						{/each}
 					</div>
 				{:else}
@@ -338,7 +425,7 @@
 	{/snippet}
 
 	{#snippet footer()}
-		<ArcaneButton action="cancel" onclick={() => (open = false)} />
+		<ArcaneButton action="cancel" onclick={closeDialog} />
 	{/snippet}
 </ResponsiveDialog>
 

@@ -52,6 +52,7 @@ import (
 	"github.com/samber/mo"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.getarcane.app/acfs"
 	buildtypes "go.getarcane.app/builds/types"
 	"go.getarcane.app/updater/labels"
 	"go.uber.org/fx/fxtest"
@@ -1113,7 +1114,9 @@ func TestProjectService_UpdateProjectServicesForcesRecreateInternal(t *testing.T
 			RepoTags:    []string{imageRef},
 			RepoDigests: []string{repository + "@" + imageDigest},
 		},
-	}, nil)
+	}, func(fullRef string, _ string) {
+		assert.Equal(t, imageRef, fullRef, "namespace dependents must not be pulled")
+	})
 
 	dockerService := &docker.DockerClientService{Client: newTestDockerClientInternal(t, server)}
 	imageUpdateService := imageupdate.NewImageUpdateService(db, nil, nil, dockerService, nil, nil, nil)
@@ -1121,7 +1124,22 @@ func TestProjectService_UpdateProjectServicesForcesRecreateInternal(t *testing.T
 	imageService := image.NewImageService(db, dockerService, nil, imageUpdateService, nil, eventService)
 
 	projectPath := createComposeProjectDir(t, projectsDir, "compose-update-force")
-	require.NoError(t, os.WriteFile(filepath.Join(projectPath, "compose.yaml"), []byte("services:\n  app:\n    image: "+imageRef+"\n    labels:\n      com.getarcaneapp.arcane.updater.strategy: digest\n  unrelated:\n    image: busybox:latest\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(projectPath, "compose.yaml"), []byte("services:\n  app:\n    image: "+imageRef+"\n    labels:\n      com.getarcaneapp.arcane.updater.strategy: digest\n  sidecar:\n    image: busybox:latest\n    network_mode: service:app\n  dormant:\n    image: busybox:latest\n    network_mode: service:app\n  never:\n    image: busybox:latest\n    pid: service:app\n  gated:\n    image: busybox:latest\n    network_mode: service:app\n    profiles: [extra]\n  unrelated:\n    image: busybox:latest\n"), 0o644))
+
+	composeContainerInternal := func(service string, state container.ContainerState) container.Summary {
+		return container.Summary{
+			ID:     service + "-container",
+			Names:  []string{"/compose-update-force-" + service + "-1"},
+			State:  state,
+			Labels: map[string]string{composeapi.ProjectLabel: "compose-update-force", composeapi.ServiceLabel: service, composeapi.ConfigHashLabel: service + "-hash"},
+		}
+	}
+	runtimeServer := newProjectRuntimeDockerServerInternal(t, []container.Summary{
+		composeContainerInternal("app", container.StateRunning),
+		composeContainerInternal("sidecar", container.StateRunning),
+		composeContainerInternal("dormant", container.StateExited),
+	})
+	t.Setenv("DOCKER_HOST", dockerHostFromProjectRuntimeServerURLInternal(t, runtimeServer.URL))
 
 	projectRecord := &Project{
 		ID:      "project-update-force",
@@ -1138,7 +1156,9 @@ func TestProjectService_UpdateProjectServicesForcesRecreateInternal(t *testing.T
 		composeStopProjectServicesInternal = originalComposeStop
 		composeUpProjectServicesInternal = originalComposeUp
 	})
-	composeStopProjectServicesInternal = func(context.Context, *composetypes.Project, []string) error {
+	var stopped []string
+	composeStopProjectServicesInternal = func(_ context.Context, _ *composetypes.Project, services []string) error {
+		stopped = services
 		return nil
 	}
 	upCalled := false
@@ -1147,9 +1167,9 @@ func TestProjectService_UpdateProjectServicesForcesRecreateInternal(t *testing.T
 		assert.True(t, eventService.ShouldSuppressDaemonEvent("container", "replacement", "app", selected.Name))
 		assert.False(t, eventService.ShouldSuppressDaemonEvent("image", "pulled-image", "", ""))
 		upCalled = true
-		assert.Equal(t, []string{"app"}, selected.ServiceNames())
+		assert.Equal(t, []string{"app", "dormant", "sidecar"}, selected.ServiceNames(), "stopped dependents stay in the model for recreation")
 		forceRecreate = force
-		assert.Equal(t, []string{"app"}, services)
+		assert.Equal(t, []string{"app", "sidecar"}, services, "stopped dependents are not started")
 		assert.False(t, removeOrphans)
 		return errors.New("compose up failed after assertion")
 	}
@@ -1160,6 +1180,7 @@ func TestProjectService_UpdateProjectServicesForcesRecreateInternal(t *testing.T
 	assert.True(t, eventService.ShouldSuppressDaemonEvent("container", "replacement", "app", "compose-update-force"), "failed updates retain correlation through rollback grace")
 	assert.False(t, eventService.ShouldSuppressDaemonEvent("container", "unrelated", "unrelated", "other-project"))
 	assert.True(t, upCalled)
+	assert.Equal(t, []string{"app", "sidecar"}, stopped)
 	assert.True(t, forceRecreate, "service updates must force recreate after pulling the updated image")
 }
 
@@ -2983,7 +3004,7 @@ func TestProjectService_ApplyGitSyncProjectFiles_MigratesDirectEnvIntoProjectOve
 	require.NoError(t, db.Create(project).Error)
 
 	gitEnv := "TOKEN=git\nREMOTE_ONLY=1\n"
-	updated, err := svc.ApplyGitSyncProjectFiles(ctx, project.ID, "services:\n  app:\n    image: nginx:alpine\n", &gitEnv, nil, "", common.User{
+	updated, _, err := svc.ApplyGitSyncProjectFiles(ctx, project.ID, "services:\n  app:\n    image: nginx:alpine\n", &gitEnv, nil, "", common.User{
 		ID:       "u1",
 		Username: "tester",
 	})
@@ -3040,13 +3061,14 @@ func TestProjectService_ApplyGitSyncProjectFiles_PreservesGitEnvSyntax(t *testin
 `
 	gitEnv := "# keep git formatting\nZ_LAST=last\nCLOUDFLARE_CLIENT_SECRET=$$pbkdf2-sha512$$310000$$XXX\nQUOTED_SECRET='$pbkdf2-sha512$310000$XXX'\nA_FIRST=first"
 
-	for range 2 {
-		updated, err := svc.ApplyGitSyncProjectFiles(ctx, project.ID, compose, &gitEnv, nil, "", common.User{
+	for i := range 2 {
+		updated, changed, err := svc.ApplyGitSyncProjectFiles(ctx, project.ID, compose, &gitEnv, nil, "", common.User{
 			ID:       "u1",
 			Username: "tester",
 		})
 		require.NoError(t, err)
 		require.NotNil(t, updated)
+		assert.Equal(t, i == 0, changed)
 
 		effectiveBytes, readErr := os.ReadFile(filepath.Join(projectPath, ".env"))
 		require.NoError(t, readErr)
@@ -3096,7 +3118,7 @@ func TestProjectService_ApplyGitSyncProjectFiles_NormalizesStaleCopiedGitOverrid
 	}
 	require.NoError(t, db.Create(project).Error)
 
-	updated, err := svc.ApplyGitSyncProjectFiles(ctx, project.ID, "services:\n  app:\n    image: nginx:alpine\n", new("BASE=git-updated\nSHARED=1\nREMOTE_ONLY=1\n"), nil, "", common.User{
+	updated, _, err := svc.ApplyGitSyncProjectFiles(ctx, project.ID, "services:\n  app:\n    image: nginx:alpine\n", new("BASE=git-updated\nSHARED=1\nREMOTE_ONLY=1\n"), nil, "", common.User{
 		ID:       "u1",
 		Username: "tester",
 	})
@@ -3144,7 +3166,7 @@ func TestProjectService_ApplyGitSyncProjectFiles_RemovesLegacyDeletedGitMasks(t 
 	}
 	require.NoError(t, db.Create(project).Error)
 
-	updated, err := svc.ApplyGitSyncProjectFiles(ctx, project.ID, "services:\n  app:\n    image: nginx:alpine\n", new("TOKEN=git-updated\nSHARED=1\nREMOTE_ONLY=1\n"), nil, "", common.User{
+	updated, _, err := svc.ApplyGitSyncProjectFiles(ctx, project.ID, "services:\n  app:\n    image: nginx:alpine\n", new("TOKEN=git-updated\nSHARED=1\nREMOTE_ONLY=1\n"), nil, "", common.User{
 		ID:       "u1",
 		Username: "tester",
 	})
@@ -3192,7 +3214,7 @@ func TestProjectService_ApplyGitSyncProjectFiles_RemovesGitEnvSource(t *testing.
 	}
 	require.NoError(t, db.Create(project).Error)
 
-	updated, err := svc.ApplyGitSyncProjectFiles(ctx, project.ID, "services:\n  app:\n    image: nginx:alpine\n", nil, nil, "", common.User{
+	updated, _, err := svc.ApplyGitSyncProjectFiles(ctx, project.ID, "services:\n  app:\n    image: nginx:alpine\n", nil, nil, "", common.User{
 		ID:       "u1",
 		Username: "tester",
 	})
@@ -3235,7 +3257,7 @@ func TestProjectService_ApplyGitSyncProjectFiles_WritesAndRemovesComposeOverride
 	require.NoError(t, db.Create(project).Error)
 
 	overrideContent := "services:\n  app:\n    image: busybox:latest\n"
-	updated, err := svc.ApplyGitSyncProjectFiles(ctx, project.ID, "services:\n  app:\n    image: nginx:alpine\n", nil, new(overrideContent), "compose.override.yaml", common.User{
+	updated, _, err := svc.ApplyGitSyncProjectFiles(ctx, project.ID, "services:\n  app:\n    image: nginx:alpine\n", nil, new(overrideContent), "compose.override.yaml", common.User{
 		ID:       "u1",
 		Username: "tester",
 	})
@@ -3247,7 +3269,7 @@ func TestProjectService_ApplyGitSyncProjectFiles_WritesAndRemovesComposeOverride
 	assert.Equal(t, overrideContent, string(overrideBytes))
 
 	// A subsequent sync without an override removes the previously synced file.
-	updated, err = svc.ApplyGitSyncProjectFiles(ctx, project.ID, "services:\n  app:\n    image: nginx:alpine\n", nil, nil, "", common.User{
+	updated, _, err = svc.ApplyGitSyncProjectFiles(ctx, project.ID, "services:\n  app:\n    image: nginx:alpine\n", nil, nil, "", common.User{
 		ID:       "u1",
 		Username: "tester",
 	})
@@ -3293,7 +3315,7 @@ func TestProjectService_ApplyGitSyncProjectFiles_UsesGlobalEnvDuringComposeValid
       - ${MYPATH}cats/templates:/app/templates
 `
 
-	updated, err := svc.ApplyGitSyncProjectFiles(ctx, project.ID, compose, nil, nil, "", common.User{
+	updated, _, err := svc.ApplyGitSyncProjectFiles(ctx, project.ID, compose, nil, nil, "", common.User{
 		ID:       "u1",
 		Username: "tester",
 	})
@@ -3345,7 +3367,7 @@ func TestProjectService_ApplyGitSyncProjectFiles_TolerantOfUndefinedComposeVar(t
 	}
 	require.NoError(t, db.Create(project).Error)
 
-	updated, err := svc.ApplyGitSyncProjectFiles(ctx, project.ID, compose, nil, nil, "", common.User{
+	updated, _, err := svc.ApplyGitSyncProjectFiles(ctx, project.ID, compose, nil, nil, "", common.User{
 		ID:       "u1",
 		Username: "tester",
 	})
@@ -3940,7 +3962,7 @@ func TestBuildDiscoveredComposeProjectUpdateRowsInternal_FallsBackToImageID(t *t
 		CheckTime:      time.Now().UTC(),
 	}).Error)
 
-	rows := buildDiscoveredComposeProjectUpdateRowsInternal(ctx, []container.Summary{
+	containers := []container.Summary{
 		{
 			ID:      "media-web",
 			Image:   "nginx:latest",
@@ -3951,10 +3973,44 @@ func TestBuildDiscoveredComposeProjectUpdateRowsInternal_FallsBackToImageID(t *t
 				"com.docker.compose.service": "web",
 			},
 		},
-	}, map[string]struct{}{}, imageService, iconcatalog.DefaultCatalog)
+		{
+			ID:      "media-web-replica",
+			Image:   "nginx:latest",
+			ImageID: "sha256:media-image",
+			State:   "running",
+			Labels: map[string]string{
+				"com.docker.compose.project": "media",
+				"com.docker.compose.service": "web",
+				labels.LabelUpdater:          "false",
+			},
+		},
+		{
+			ID:      "pinned-web",
+			Image:   "nginx:1.25.0",
+			ImageID: "sha256:media-image",
+			State:   "running",
+			Labels: map[string]string{
+				"com.docker.compose.project": "pinned",
+				"com.docker.compose.service": "web",
+				labels.LabelUpdateStrategy:   "tag",
+			},
+		},
+	}
+	rows := buildDiscoveredComposeProjectUpdateRowsInternal(ctx, containers, map[string]struct{}{}, imageService, iconcatalog.DefaultCatalog)
 
-	require.Len(t, rows, 1)
+	require.Len(t, rows, 1, "replicas count once and a tag policy never inherits the digest check")
+	assert.Equal(t, "compose:media", rows[0].ID)
 	assert.Equal(t, []string{"nginx:latest"}, rows[0].UpdateInfo.UpdatedImageRefs)
+
+	// The tracked-project path resolves the same record through the runtime image ID.
+	service := &ProjectService{imageService: imageService}
+	detail := projecttypes.Details{ID: "tracked", RuntimeServices: []projecttypes.RuntimeService{{Name: "web", ContainerID: "media-web", Image: "nginx:latest", ImageID: "sha256:media-image", ContainerLabels: containers[0].Labels}}}
+	service.enrichProjectUpdateInfoInternal(ctx, &detail)
+	require.True(t, detail.UpdateInfo.HasUpdate)
+	assert.Equal(t, []string{"nginx:latest"}, detail.UpdateInfo.UpdatedImageRefs)
+	detail.RuntimeServices[0].ImageID = ""
+	service.enrichProjectUpdateInfoInternal(ctx, &detail)
+	require.False(t, detail.UpdateInfo.HasUpdate, "a missing runtime image ID inherits nothing")
 }
 
 func TestProjectService_ListProjects_FiltersArchivedProjects(t *testing.T) {
@@ -7270,16 +7326,19 @@ func TestProjectPathMapperUsesCurrentSettingsInternal(t *testing.T) {
 }
 
 func TestPrepareProjectServiceImages(t *testing.T) {
-	source := []byte("# operator configuration\nservices:\n  web:\n    image: \"app:${VERSION}\" # keep this comment\n    environment:\n      VERSION: ${VERSION}\n  worker:\n    image: app:${VERSION}\n")
-	effective := &composetypes.Project{Services: composetypes.Services{"web": {Image: "app:1.2.0"}, "worker": {Image: "app:1.2.0"}}}
-	updated, names, err := prepareProjectServiceImagesInternal(source, effective, map[string]updatertypes.ServiceImageChange{"web": {ExpectedRef: "docker.io/library/app:1.2.0", TargetRef: "app:1.3.0"}})
+	source := []byte("\xEF\xBB\xBF# operator configuration\r\n\r\nservices:\r\n  web:\r\n    image: \"app:${VERSION}\"   # keep this comment\r\n    environment:\r\n      VERSION: ${VERSION}\r\n\r\n  worker:\r\n    image: 'app:1.2.0'  \r\n  tagged:\r\n    image: !!str app:1.2.0\r\n  escaped:\r\n    image: \"app\\u003a1.2.0\"\r\n  untouched:\r\n    image: app:1.2.0 # stays\r\n\r\r  plain:\r\n    image: app:1.2.0")
+	expected := "\xEF\xBB\xBF# operator configuration\r\n\r\nservices:\r\n  web:\r\n    image: \"app:1.3.0\"   # keep this comment\r\n    environment:\r\n      VERSION: ${VERSION}\r\n\r\n  worker:\r\n    image: 'docker.io/library/app:1.3.0'  \r\n  tagged:\r\n    image: !!str app:1.3.0\r\n  escaped:\r\n    image: \"app:1.3.0\"\r\n  untouched:\r\n    image: app:1.2.0 # stays\r\n\r\r  plain:\r\n    image: app:1.3.0"
+	effective := &composetypes.Project{Services: composetypes.Services{"web": {Image: "app:1.2.0"}, "worker": {Image: "app:1.2.0"}, "tagged": {Image: "app:1.2.0"}, "escaped": {Image: "app:1.2.0"}, "untouched": {Image: "app:1.2.0"}, "plain": {Image: "app:1.2.0"}}}
+	updated, names, err := prepareProjectServiceImagesInternal(source, effective, map[string]updatertypes.ServiceImageChange{
+		"web":     {ExpectedRef: "docker.io/library/app:1.2.0", TargetRef: "app:1.3.0"},
+		"worker":  {ExpectedRef: "app:1.2.0", TargetRef: "docker.io/library/app:1.3.0"},
+		"tagged":  {ExpectedRef: "app:1.2.0", TargetRef: "app:1.3.0"},
+		"escaped": {ExpectedRef: "app:1.2.0", TargetRef: "app:1.3.0"},
+		"plain":   {ExpectedRef: "app:1.2.0", TargetRef: "app:1.3.0"},
+	})
 	require.NoError(t, err)
-	require.Equal(t, []string{"web"}, names)
-	require.Contains(t, string(updated), "# operator configuration")
-	require.Contains(t, string(updated), "# keep this comment")
-	require.Contains(t, string(updated), "image: \"app:1.3.0\"")
-	require.Contains(t, string(updated), "image: app:${VERSION}")
-	require.Contains(t, string(updated), "VERSION: ${VERSION}")
+	require.Equal(t, []string{"escaped", "plain", "tagged", "web", "worker"}, names)
+	require.Equal(t, expected, string(updated))
 	require.Equal(t, "app:1.2.0", effective.Services["web"].Image)
 }
 
@@ -7292,6 +7351,8 @@ func TestPrepareProjectServiceImagesRejectsUnsupportedSource(t *testing.T) {
 		{"image alias", "x-image: &image app:1.2.0\nservices:\n  web:\n    image: *image\n", "app:1.2.0"},
 		{"missing image", "services:\n  web:\n    build: .\n", "app:1.2.0"},
 		{"multiple documents", "services:\n  web:\n    image: app:1.2.0\n---\nservices: {}\n", "app:1.2.0"},
+		{"literal block image", "services:\n  web:\n    image: |\n      app:1.2.0\n", "app:1.2.0"},
+		{"multi-line plain image", "services:\n  web:\n    image: app:${VERSION}\n      tail\n", "app:1.2.0"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			effective := &composetypes.Project{Services: composetypes.Services{"web": {Image: "app:1.2.0"}}}
@@ -7379,7 +7440,7 @@ func TestUpdateProjectServiceImagesPersistsBeforeDeploymentAndRetries(t *testing
 	require.NoError(t, err)
 	require.NoError(t, settingsService.SetStringSetting(ctx, "projectsDirectory", directory))
 	projectPath := createComposeProjectDir(t, directory, "image-tags")
-	source := "# keep\nservices:\n  app:\n    image: app:${VERSION}\n  worker:\n    image: app:${VERSION}\n"
+	source := "# keep\n\nservices:\n  app:\n    image: app:${VERSION}\n\n  worker:\n    image: app:${VERSION}\n"
 	require.NoError(t, os.WriteFile(filepath.Join(projectPath, "compose.yaml"), []byte(source), 0o600))
 	require.NoError(t, os.Chmod(filepath.Join(projectPath, "compose.yaml"), 0o600))
 	require.NoError(t, os.WriteFile(filepath.Join(projectPath, ".env"), []byte("VERSION=1.2.0\n"), 0o600))
@@ -7394,8 +7455,7 @@ func TestUpdateProjectServiceImagesPersistsBeforeDeploymentAndRetries(t *testing
 		require.ErrorIs(t, err, deploymentError)
 		content, err := os.ReadFile(filepath.Join(projectPath, "compose.yaml"))
 		require.NoError(t, err)
-		require.Contains(t, string(content), "image: app:1.3.0")
-		require.Contains(t, string(content), "image: app:${VERSION}")
+		require.Equal(t, "# keep\n\nservices:\n  app:\n    image: app:1.3.0\n\n  worker:\n    image: app:${VERSION}\n", string(content))
 		mode, err := os.Stat(filepath.Join(projectPath, "compose.yaml"))
 		require.NoError(t, err)
 		require.Equal(t, os.FileMode(0o600), mode.Mode().Perm())
@@ -7459,12 +7519,15 @@ func TestDiscoveredProjectTagUpdatesRemainScoped(t *testing.T) {
 	require.Equal(t, target, detail.UpdateInfo.UpdateInfoByRef["example:3.1.0"].LatestVersion)
 	delete(containers[1].Labels, labels.LabelUpdateStrategy)
 	rows = buildDiscoveredComposeProjectUpdateRowsInternal(t.Context(), containers, nil, imageSvc, "")
-	require.Len(t, rows, 1, "removing tag strategy retains automatic stable-version updates")
-	require.True(t, rows[0].UpdateInfo.HasUpdate)
+	require.Empty(t, rows, "removing the strategy label falls back to digest checks")
 	detail.RuntimeServices[0].ContainerLabels = containers[1].Labels
 	service.enrichProjectUpdateInfoInternal(t.Context(), &detail)
-	require.True(t, detail.UpdateInfo.HasUpdate, "default auto is equivalent to explicit tag for a stable full version")
-	for _, policy := range []map[string]string{{labels.LabelUpdateStrategy: "digest"}, {labels.LabelUpdateStrategy: "tag", labels.LabelUpdateConstraint: "3.1.x"}, {labels.LabelUpdateStrategy: "tag", labels.LabelUpdateTagPattern: ".*"}, {labels.LabelUpdateStrategy: "tag", labels.LabelUpdater: "off"}} {
+	require.False(t, detail.UpdateInfo.HasUpdate, "an undeclared strategy no longer inherits a tag record")
+	// Turning off automatic installation keeps the check current (#3532).
+	containers[1].Labels = map[string]string{labels.LabelUpdateStrategy: "tag", labels.LabelUpdater: "off", "com.docker.compose.project": "first-project", "com.docker.compose.service": "web"}
+	rows = buildDiscoveredComposeProjectUpdateRowsInternal(t.Context(), containers, nil, imageSvc, "")
+	require.Len(t, rows, 1, "updater=false containers keep their check results")
+	for _, policy := range []map[string]string{{labels.LabelUpdateStrategy: "digest"}, {labels.LabelUpdateStrategy: "tag", labels.LabelUpdateConstraint: "3.1.x"}, {labels.LabelUpdateStrategy: "tag", labels.LabelUpdateTagPattern: ".*"}, {labels.LabelUpdateStrategy: "tag", imageref.UpdateCheckLabel: "off"}} {
 		current := map[string]string{"com.docker.compose.project": "first-project", "com.docker.compose.service": "web"}
 		for key, value := range policy {
 			current[key] = value
@@ -7490,6 +7553,17 @@ func TestProjectTagSummaryDoesNotMutateSharedReferenceResults(t *testing.T) {
 	require.Empty(t, merged["example:3.1.0"].LatestVersion)
 	require.False(t, base["example:3.1.0"].HasUpdate)
 	require.Equal(t, "3.2.0", scoped["first"].LatestVersion)
+
+	// A shared image result is dropped when every service using the reference
+	// opted out of update checks, and kept while one still monitors it.
+	base = map[string]*imagetypes.UpdateInfo{"example:3.1.0": {HasUpdate: true, UpdateType: "digest"}, "other:1.0": {HasUpdate: true, UpdateType: "digest"}}
+	unmonitored := map[string]string{imageref.UpdateCheckLabel: "false"}
+	merged = mergeProjectContainerUpdateInfoInternal(base, []projecttypes.RuntimeService{{ContainerID: "a", Image: "example:3.1.0", ContainerLabels: unmonitored}, {ContainerID: "b", Image: "example:3.1.0", ContainerLabels: map[string]string{labels.LabelUpdater: "false"}}}, nil)
+	require.True(t, merged["example:3.1.0"].HasUpdate, "updater=false keeps the shared result")
+	require.True(t, merged["other:1.0"].HasUpdate, "references without runtime services are untouched")
+	merged = mergeProjectContainerUpdateInfoInternal(base, []projecttypes.RuntimeService{{ContainerID: "a", Image: "example:3.1.0", ContainerLabels: unmonitored}}, nil)
+	require.NotContains(t, merged, "example:3.1.0")
+	require.True(t, base["example:3.1.0"].HasUpdate)
 }
 
 func TestCountProjectsWithPendingTagUpdatesUsesRuntimeContainers(t *testing.T) {
@@ -7514,6 +7588,23 @@ func TestCountProjectsWithPendingTagUpdatesUsesRuntimeContainers(t *testing.T) {
 	count, err = service.CountProjectsWithPendingUpdates(t.Context(), containers)
 	require.NoError(t, err)
 	require.Zero(t, count)
+
+	// A digest check stored under another local tag of the running image marks
+	// the project once, however many replicas share the image.
+	require.NoError(t, db.Create(&Project{Name: "third", Path: "third", ImageRefsJSON: `["app:latest"]`}).Error)
+	require.NoError(t, db.Create(&imageupdate.ImageUpdateRecord{ID: "moving-image", Repository: "docker.io/library/app", Tag: "stable", HasUpdate: true, UpdateType: "digest"}).Error)
+	containers = append(containers,
+		container.Summary{ID: "third-one", Image: "app:latest", ImageID: "moving-image", Labels: map[string]string{"com.docker.compose.project": "third", "com.docker.compose.service": "web"}},
+		container.Summary{ID: "third-two", Image: "app:latest", ImageID: "moving-image", Labels: map[string]string{"com.docker.compose.project": "third", "com.docker.compose.service": "web", labels.LabelUpdater: "false"}},
+	)
+	count, err = service.CountProjectsWithPendingUpdates(t.Context(), containers)
+	require.NoError(t, err)
+	require.Equal(t, 1, count)
+	containers[2].Labels[imageref.UpdateCheckLabel] = "false"
+	containers[3].Labels[imageref.UpdateCheckLabel] = "false"
+	count, err = service.CountProjectsWithPendingUpdates(t.Context(), containers)
+	require.NoError(t, err)
+	require.Zero(t, count, "disabling update checks on every replica suppresses the project")
 }
 
 type serviceTagTransportInternal struct {
@@ -7522,6 +7613,10 @@ type serviceTagTransportInternal struct {
 }
 
 func (s *serviceTagTransportInternal) RoundTrip(request *http.Request) (*http.Response, error) {
+	// The /v2/ version check precedes every listing and is not a tag call.
+	if request.URL.Path == "/v2/" {
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: http.NoBody, Request: request}, nil
+	}
 	s.calls++
 	payload, err := json.Marshal(map[string]any{"name": "library/app", "tags": s.tags})
 	if err != nil {
@@ -7544,7 +7639,7 @@ func TestProjectServiceManualUpdateDiscoversTags(t *testing.T) {
 		{name: "new tag", tags: []string{"1.2.0", "1.3.0", "2.0.0"}, wantRef: "docker.io/library/app:1.3.0", wantChanged: true, wantCalls: 1},
 		{name: "same tag digest fallback", tags: []string{"1.2.0", "2.0.0"}, wantRef: "app:1.2.0", wantCalls: 1},
 		{name: "planned dependency does not discover tags", tags: []string{"1.2.0", "1.3.0"}, wantRef: "app:1.2.0", skipDiscovery: true},
-		{name: "unlabeled automatic tag", tags: []string{"1.2.0", "1.3.0", "2.0.0"}, wantRef: "docker.io/library/app:1.3.0", wantChanged: true, wantCalls: 1, omitLabels: true},
+		{name: "unlabeled digest default", tags: []string{"1.2.0", "1.3.0", "2.0.0"}, wantRef: "app:1.2.0", omitLabels: true},
 		{name: "explicit automatic tag", tags: []string{"1.2.0", "1.3.0", "2.0.0"}, wantRef: "docker.io/library/app:1.3.0", wantChanged: true, wantCalls: 1, strategy: "auto"},
 		{name: "explicit digest optout", tags: []string{"1.2.0", "1.3.0"}, wantRef: "app:1.2.0", strategy: "digest"},
 	} {
@@ -7585,7 +7680,7 @@ func TestProjectServiceManualUpdateDiscoversTags(t *testing.T) {
 			content, err := os.ReadFile(filepath.Join(path, "compose.yaml"))
 			require.NoError(t, err)
 			if tt.wantChanged {
-				require.Contains(t, string(content), tt.wantRef)
+				require.Equal(t, strings.Replace(source, "image: app:1.2.0", "image: "+tt.wantRef, 1), string(content))
 			} else {
 				require.Equal(t, source, string(content))
 			}
@@ -7705,18 +7800,18 @@ func TestConfiguredProjectUsesScheduledRuntimeChecks(t *testing.T) {
 			require.NoError(t, err)
 			require.NoError(t, settingsService.SetStringSetting(ctx, "projectsDirectory", directory))
 			path := createComposeProjectDir(t, directory, "scheduled-project")
-			sourceLabels := composetypes.Labels{}
-			source := "services:\n  web:\n    image: " + tt.sourceRef + "\n"
+			sourceLabels := composetypes.Labels{labels.LabelUpdateStrategy: "auto"}
+			source := "services:\n  web:\n    image: " + tt.sourceRef + "\n    labels:\n      com.getarcaneapp.arcane.updater.strategy: auto\n"
 			if tt.sourceConstraint != "" {
 				sourceLabels[labels.LabelUpdateConstraint] = tt.sourceConstraint
-				source += "    labels:\n      com.getarcaneapp.arcane.updater.constraint: " + tt.sourceConstraint + "\n"
+				source += "      com.getarcaneapp.arcane.updater.constraint: " + tt.sourceConstraint + "\n"
 			}
 			require.NoError(t, os.WriteFile(filepath.Join(path, "compose.yaml"), []byte(source), 0o600))
 			proj := Project{ID: "scheduled-project", Name: "scheduled-project", Path: path}
 			require.NoError(t, db.Create(&proj).Error)
 			target := "3.2.0"
-			require.NoError(t, db.Create(&imageupdate.ImageUpdateRecord{ID: "container::scheduled", ContainerID: "scheduled", ImageID: "shared", PolicyKey: imageref.UpdatePolicyKey("example:3.1.0", nil), Repository: "docker.io/library/example", Tag: "3.1.0", LatestVersion: &target, HasUpdate: true, UpdateType: "tag", CheckTime: time.Now()}).Error)
-			runtimeLabels := map[string]string{"com.docker.compose.project": "scheduled-project", "com.docker.compose.service": "web"}
+			require.NoError(t, db.Create(&imageupdate.ImageUpdateRecord{ID: "container::scheduled", ContainerID: "scheduled", ImageID: "shared", PolicyKey: imageref.UpdatePolicyKey("example:3.1.0", map[string]string{labels.LabelUpdateStrategy: "auto"}), Repository: "docker.io/library/example", Tag: "3.1.0", LatestVersion: &target, HasUpdate: true, UpdateType: "tag", CheckTime: time.Now()}).Error)
+			runtimeLabels := map[string]string{"com.docker.compose.project": "scheduled-project", "com.docker.compose.service": "web", labels.LabelUpdateStrategy: "auto"}
 			if tt.runtimeConstraint != "" {
 				runtimeLabels[labels.LabelUpdateConstraint] = tt.runtimeConstraint
 			}
@@ -7763,6 +7858,14 @@ func TestConfiguredProjectAggregatesReplicaAndPreviewChecks(t *testing.T) {
 	require.Empty(t, summary.ServiceUpdates["web"].UpdateInfo.LatestVersion)
 	require.Empty(t, summary.UpdateInfoByRef["example:3.1.0"].LatestVersion)
 	require.Equal(t, "3.2.0", scoped["two"].LatestVersion, "aggregation must not modify shared checks")
+
+	// A configured check reporting no update does not hide a pending replica.
+	records[0].HasUpdate = false
+	records[0].LatestVersion = nil
+	summary = BuildConfiguredUpdateInfo("project", configs, nil, records, runtimeUpdates)
+	require.True(t, summary.HasUpdate)
+	require.True(t, summary.ServiceUpdates["web"].UpdateInfo.HasUpdate)
+	require.Equal(t, "3.2.0", scoped["two"].LatestVersion)
 }
 
 func TestPrepareProjectBindDirectoriesInternal(t *testing.T) {
@@ -7812,15 +7915,48 @@ func TestPrepareProjectBindDirectoriesInternal(t *testing.T) {
 		assert.NoDirExists(t, filepath.Join(projectPath, "named"))
 	})
 
-	t.Run("rejects symlink escaping the project", func(t *testing.T) {
+	t.Run("skips sources reached through symlinks escaping the project", func(t *testing.T) {
+		t.Parallel()
+		parent := t.TempDir()
+		projectPath := filepath.Join(parent, "project")
+		require.NoError(t, os.Mkdir(projectPath, 0o755))
+		outside := filepath.Join(parent, "appdata")
+		existingExternal := filepath.Join(outside, "jellyfin", "data")
+		require.NoError(t, os.MkdirAll(existingExternal, 0o700))
+		require.NoError(t, os.Symlink(outside, filepath.Join(projectPath, "abs")))
+		require.NoError(t, os.Symlink(filepath.Join("..", "appdata"), filepath.Join(projectPath, "rel")))
+
+		project := newProject(
+			bind(filepath.Join(projectPath, "abs", "jellyfin", "data")),
+			bind(filepath.Join(projectPath, "abs", "missing")),
+			bind(filepath.Join(projectPath, "rel", "jellyfin", "data")),
+			bind(filepath.Join(projectPath, "rel", "other")),
+			bind(filepath.Join(projectPath, "local", "conf")),
+		)
+
+		require.NoError(t, prepareProjectBindDirectoriesInternal(projectPath)(context.Background(), project))
+
+		info, err := os.Stat(existingExternal)
+		require.NoError(t, err)
+		assert.Equal(t, os.FileMode(0o700), info.Mode().Perm(), "external directory permissions preserved")
+		assert.NoDirExists(t, filepath.Join(outside, "missing"))
+		assert.NoDirExists(t, filepath.Join(outside, "other"))
+		assert.DirExists(t, filepath.Join(projectPath, "local", "conf"))
+	})
+
+	t.Run("reports symlink loops and canceled contexts", func(t *testing.T) {
 		t.Parallel()
 		projectPath := t.TempDir()
-		outside := t.TempDir()
-		require.NoError(t, os.Symlink(outside, filepath.Join(projectPath, "link")))
+		require.NoError(t, os.Symlink("loop", filepath.Join(projectPath, "loop")))
 
-		err := prepareProjectBindDirectoriesInternal(projectPath)(context.Background(), newProject(bind(filepath.Join(projectPath, "link", "conf"))))
-		require.Error(t, err)
+		err := prepareProjectBindDirectoriesInternal(projectPath)(context.Background(), newProject(bind(filepath.Join(projectPath, "loop", "conf"))))
+		require.ErrorIs(t, err, acfs.ErrSymlinkLoop)
 		assert.Contains(t, err.Error(), "service app")
-		assert.NoDirExists(t, filepath.Join(outside, "conf"))
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		err = prepareProjectBindDirectoriesInternal(projectPath)(ctx, newProject(bind(filepath.Join(projectPath, "conf"))))
+		require.ErrorIs(t, err, context.Canceled)
+		assert.NoDirExists(t, filepath.Join(projectPath, "conf"))
 	})
 }

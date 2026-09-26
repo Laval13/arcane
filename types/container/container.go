@@ -1065,6 +1065,11 @@ type Details struct {
 	// Required: true
 	AutoUpdateEnabled bool `json:"autoUpdateEnabled"`
 
+	// UpdateInfo is the stored update check matching this container's current policy.
+	//
+	// Required: false
+	UpdateInfo *imagetypes.UpdateInfo `json:"updateInfo,omitempty"`
+
 	// ActivityID is the background activity that tracked the action returning these details.
 	//
 	// Required: false
@@ -1865,4 +1870,17 @@ func mapEditNetworks(c *container.InspectResponse) map[string]EditConfigNetwork 
 	}
 
 	return out
+}
+
+// Processes is the process snapshot Docker reports for a running container.
+type Processes struct {
+	// Titles are the column headers Docker returned, in order.
+	//
+	// Required: true
+	Titles []string `json:"titles"`
+
+	// Processes are the rows Docker returned; each row is positional to Titles.
+	//
+	// Required: true
+	Processes [][]string `json:"processes"`
 }

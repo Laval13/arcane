@@ -69,6 +69,15 @@ func writeImageInternal(t *testing.T, imageRef string, img v1.Image, options ...
 	require.NoError(t, remote.Write(mustParseReferenceInternal(t, imageRef), img, options...))
 }
 
+func imageSizeInternal(t *testing.T, img v1.Image) int64 {
+	t.Helper()
+	digest, err := img.Digest()
+	require.NoError(t, err)
+	platform, err := tagPlatformInternal(img, nil, digest)
+	require.NoError(t, err)
+	return platform.Size
+}
+
 func browseParamsInternal(search string) pagination.QueryParams {
 	return pagination.QueryParams{
 		SearchQuery: pagination.SearchQuery{Search: search},
@@ -121,8 +130,7 @@ func TestContainerRegistryService_ListRepositoryTagsSingleImageInternal(t *testi
 
 	digest, err := img.Digest()
 	require.NoError(t, err)
-	size, err := imageSizeInternal(img)
-	require.NoError(t, err)
+	size := imageSizeInternal(t, img)
 
 	tag := tags[0]
 	assert.Equal(t, "1.0", tag.Name)
@@ -163,10 +171,8 @@ func TestContainerRegistryService_ListRepositoryTagsIndexInternal(t *testing.T) 
 	require.NoError(t, err)
 	require.Len(t, tags, 1)
 
-	amd64Size, err := imageSizeInternal(amd64Image)
-	require.NoError(t, err)
-	arm64Size, err := imageSizeInternal(arm64Image)
-	require.NoError(t, err)
+	amd64Size := imageSizeInternal(t, amd64Image)
+	arm64Size := imageSizeInternal(t, arm64Image)
 
 	tag := tags[0]
 	assert.Empty(t, tag.Error)

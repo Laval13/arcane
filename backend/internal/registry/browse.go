@@ -7,7 +7,6 @@ import (
 	"slices"
 	"strings"
 	"sync"
-	"time"
 
 	"emperror.dev/errors"
 	"github.com/google/go-containerregistry/pkg/authn"
@@ -18,25 +17,26 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/getarcaneapp/arcane/backend/v2/internal/common"
-	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/timeouts"
+	utilsregistry "github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/registryauth"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/pagination"
 	"github.com/getarcaneapp/arcane/types/v2/containerregistry"
 )
 
 const tagDetailsConcurrency = 4
 
-// browseTargetInternal is a registry resolved for the distribution API.
+// browseTargetInternal is a configured registry resolved for the distribution API.
 type browseTargetInternal struct {
 	registry name.Registry
 	// prefix is the repository namespace configured in the registry URL, if any.
-	prefix  string
-	options []remote.Option
+	prefix      string
+	nameOptions []name.Option
+	options     []remote.Option
 }
 
 // ListRepositories lists the repositories of a configured registry through the
 // catalog API, limited to the namespace of the registry URL.
 func (s *ContainerRegistryService) ListRepositories(ctx context.Context, id string, params pagination.QueryParams) ([]containerregistry.Repository, pagination.Response, error) {
-	lookupCtx, cancel := s.browseContextInternal(ctx)
+	lookupCtx, cancel := s.tagLookupContextInternal(ctx)
 	defer cancel()
 
 	target, err := s.browseTargetInternal(lookupCtx, id)
@@ -48,31 +48,25 @@ func (s *ContainerRegistryService) ListRepositories(ctx context.Context, id stri
 	if err != nil {
 		return nil, pagination.Response{}, classifyBrowseErrorInternal(err, "failed to list repositories (the registry may not support the catalog API)")
 	}
+	if target.prefix != "" {
+		names = slices.DeleteFunc(names, func(repositoryName string) bool {
+			return !strings.HasPrefix(repositoryName, target.prefix+"/")
+		})
+	}
 
-	items := make([]containerregistry.Repository, 0, len(names))
-	for _, repositoryName := range names {
-		if target.prefix != "" && !strings.HasPrefix(repositoryName, target.prefix+"/") {
-			continue
-		}
+	page, response := paginateNamesInternal(names, params)
+	items := make([]containerregistry.Repository, 0, len(page))
+	for _, repositoryName := range page {
 		items = append(items, containerregistry.Repository{Name: repositoryName})
 	}
-
-	config := pagination.Config[containerregistry.Repository]{
-		SearchAccessors: []pagination.SearchAccessor[containerregistry.Repository]{
-			func(item containerregistry.Repository) (string, error) { return item.Name, nil },
-		},
-		SortBindings: []pagination.SortBinding[containerregistry.Repository]{
-			{Key: "name", Fn: func(a, b containerregistry.Repository) int { return strings.Compare(a.Name, b.Name) }},
-		},
-	}
-	result := config.SearchOrderAndPaginate(items, params)
-	return result.Items, pagination.BuildResponse(result.TotalCount, result.TotalAvailable, params), nil
+	return items, response, nil
 }
 
 // ListRepositoryTags lists the tags of a repository. Manifest details are only
-// fetched for the requested page.
+// fetched for the requested page, and a failure is recorded on the tag itself
+// so one unreadable manifest does not hide the rest of the page.
 func (s *ContainerRegistryService) ListRepositoryTags(ctx context.Context, id, repository string, params pagination.QueryParams) ([]containerregistry.RepositoryTag, pagination.Response, error) {
-	lookupCtx, cancel := s.browseContextInternal(ctx)
+	lookupCtx, cancel := s.tagLookupContextInternal(ctx)
 	defer cancel()
 
 	target, err := s.browseTargetInternal(lookupCtx, id)
@@ -84,35 +78,34 @@ func (s *ContainerRegistryService) ListRepositoryTags(ctx context.Context, id, r
 		return nil, pagination.Response{}, err
 	}
 
-	tagNames, err := remote.List(repo, append(slices.Clip(target.options), remote.WithContext(lookupCtx))...)
+	names, err := remote.List(repo, target.options...)
 	if err != nil {
 		return nil, pagination.Response{}, classifyBrowseErrorInternal(err, "failed to list tags")
 	}
 
-	items := make([]containerregistry.RepositoryTag, 0, len(tagNames))
-	for _, tagName := range tagNames {
-		items = append(items, containerregistry.RepositoryTag{Name: tagName, Platforms: []containerregistry.TagPlatform{}})
+	page, response := paginateNamesInternal(names, params)
+	items := make([]containerregistry.RepositoryTag, len(page))
+	group := errgroup.Group{}
+	group.SetLimit(tagDetailsConcurrency)
+	for i, tagName := range page {
+		group.Go(func() error {
+			tag, err := tagDetailsInternal(repo, target.options, tagName)
+			if err != nil {
+				tag.Error = err.Error()
+			}
+			items[i] = tag
+			return nil
+		})
 	}
+	_ = group.Wait()
 
-	config := pagination.Config[containerregistry.RepositoryTag]{
-		SearchAccessors: []pagination.SearchAccessor[containerregistry.RepositoryTag]{
-			func(item containerregistry.RepositoryTag) (string, error) { return item.Name, nil },
-		},
-		SortBindings: []pagination.SortBinding[containerregistry.RepositoryTag]{
-			{Key: "name", Fn: func(a, b containerregistry.RepositoryTag) int { return strings.Compare(a.Name, b.Name) }},
-		},
-	}
-	result := config.SearchOrderAndPaginate(items, params)
-
-	s.loadTagDetailsInternal(lookupCtx, repo, target.options, result.Items)
-
-	return result.Items, pagination.BuildResponse(result.TotalCount, result.TotalAvailable, params), nil
+	return items, response, nil
 }
 
 // DeleteRepositoryTag deletes the manifest a tag points to. Registries delete
 // manifests by digest, so every tag sharing that digest is removed too.
 func (s *ContainerRegistryService) DeleteRepositoryTag(ctx context.Context, id, repository, tag string) (string, error) {
-	lookupCtx, cancel := s.browseContextInternal(ctx)
+	lookupCtx, cancel := s.tagLookupContextInternal(ctx)
 	defer cancel()
 
 	target, err := s.browseTargetInternal(lookupCtx, id)
@@ -123,39 +116,31 @@ func (s *ContainerRegistryService) DeleteRepositoryTag(ctx context.Context, id, 
 	if err != nil {
 		return "", err
 	}
-	tagRef := repo.Tag(strings.TrimSpace(tag))
-	if tagRef.TagStr() != strings.TrimSpace(tag) {
-		return "", common.Classify(common.ErrValidation, errors.Errorf("invalid tag %q", tag))
+	tagRef, err := name.NewTag(repo.Name()+":"+strings.TrimSpace(tag), target.nameOptions...)
+	if err != nil {
+		return "", common.Classify(common.ErrValidation, errors.WrapIff(err, "invalid tag %q", tag))
 	}
 
-	options := append(slices.Clip(target.options), remote.WithContext(lookupCtx))
-	descriptor, err := remote.Head(tagRef, options...)
+	descriptor, err := remote.Head(tagRef, target.options...)
 	if err != nil {
 		return "", classifyBrowseErrorInternal(err, "failed to resolve tag digest")
 	}
-
 	digest := descriptor.Digest.String()
-	if err := remote.Delete(repo.Digest(digest), options...); err != nil {
+	if err := remote.Delete(repo.Digest(digest), target.options...); err != nil {
 		return "", classifyBrowseErrorInternal(err, "failed to delete manifest")
 	}
 	return digest, nil
 }
 
-func (s *ContainerRegistryService) browseContextInternal(ctx context.Context) (context.Context, context.CancelFunc) {
-	timeoutSeconds := 0
-	if s.settingsService != nil {
-		timeoutSeconds = s.settingsService.GetSettingsConfig().RegistryTagTimeout.AsInt()
-	}
-	return context.WithTimeout(ctx, timeouts.GetDuration(timeoutSeconds, timeouts.DefaultRegistryTags))
-}
-
+// browseTargetInternal resolves a stored registry into a registry name, its
+// namespace prefix, and the remote options carrying auth and transport.
 func (s *ContainerRegistryService) browseTargetInternal(ctx context.Context, id string) (*browseTargetInternal, error) {
 	reg, err := s.GetRegistryByID(ctx, id)
 	if err != nil {
 		return nil, err
 	}
 
-	host, prefix := splitRegistryURLInternal(reg.URL)
+	host, prefix := utilsregistry.SplitRegistryURL(reg.URL)
 	nameOptions := []name.Option{name.StrictValidation}
 	if reg.Insecure {
 		nameOptions = append(nameOptions, name.Insecure)
@@ -169,17 +154,24 @@ func (s *ContainerRegistryService) browseTargetInternal(ctx context.Context, id 
 	if err != nil {
 		return nil, err
 	}
-	options := []remote.Option{remote.WithAuth(authn.Anonymous)}
+	authenticator := authn.Anonymous
 	if credential != nil {
-		options = []remote.Option{remote.WithAuth(&authn.Basic{Username: credential.Username, Password: credential.Token})}
+		authenticator = authn.FromConfig(authn.AuthConfig{Username: credential.Username, Password: credential.Token})
 	}
-	if s.distributionHTTPClient != nil && s.distributionHTTPClient.Transport != nil {
+	options := []remote.Option{remote.WithContext(ctx), remote.WithAuth(authenticator)}
+	if s.distributionHTTPClient.Transport != nil {
 		options = append(options, remote.WithTransport(s.distributionHTTPClient.Transport))
 	}
 
-	return &browseTargetInternal{registry: registryName, prefix: prefix, options: options}, nil
+	return &browseTargetInternal{
+		registry:    registryName,
+		prefix:      prefix,
+		nameOptions: nameOptions,
+		options:     options,
+	}, nil
 }
 
+// repositoryInternal parses a repository name and keeps it inside the registry namespace.
 func (t *browseTargetInternal) repositoryInternal(repository string) (name.Repository, error) {
 	repository = strings.Trim(strings.TrimSpace(repository), "/")
 	if repository == "" {
@@ -188,170 +180,122 @@ func (t *browseTargetInternal) repositoryInternal(repository string) (name.Repos
 	if t.prefix != "" && !strings.HasPrefix(repository, t.prefix+"/") {
 		return name.Repository{}, common.Classify(common.ErrValidation, errors.Errorf("repository %q is outside the registry namespace %q", repository, t.prefix))
 	}
-	repo, err := name.NewRepository(t.registry.RegistryStr()+"/"+repository, name.StrictValidation)
+	repo, err := name.NewRepository(t.registry.Name()+"/"+repository, t.nameOptions...)
 	if err != nil {
 		return name.Repository{}, common.Classify(common.ErrValidation, errors.WrapIff(err, "invalid repository %q", repository))
 	}
-	// NewRepository resets registry options, so keep the insecure flag.
-	repo.Registry = t.registry
 	return repo, nil
 }
 
-// splitRegistryURLInternal separates the registry host from an optional
-// namespace path, e.g. "ghcr.io/acme" becomes ("ghcr.io", "acme").
-func splitRegistryURLInternal(registryURL string) (host, prefix string) {
-	value := strings.TrimSpace(registryURL)
-	value = strings.TrimPrefix(value, "https://")
-	value = strings.TrimPrefix(value, "http://")
-	value = strings.Trim(value, "/")
-	host, prefix, _ = strings.Cut(value, "/")
-	return host, strings.Trim(prefix, "/")
-}
-
-// loadTagDetailsInternal records per-tag failures on the tag itself so one
-// unreadable manifest does not hide the rest of the page.
-func (s *ContainerRegistryService) loadTagDetailsInternal(ctx context.Context, repo name.Repository, options []remote.Option, tags []containerregistry.RepositoryTag) {
-	var wg sync.WaitGroup
-	slots := make(chan struct{}, tagDetailsConcurrency)
-	for i := range tags {
-		wg.Go(func() {
-			slots <- struct{}{}
-			defer func() { <-slots }()
-			if err := fillTagDetailsInternal(ctx, repo, options, &tags[i]); err != nil {
-				tags[i].Error = err.Error()
-			}
-		})
+func paginateNamesInternal(names []string, params pagination.QueryParams) ([]string, pagination.Response) {
+	config := pagination.Config[string]{
+		SearchAccessors: []pagination.SearchAccessor[string]{
+			func(item string) (string, error) { return item, nil },
+		},
+		SortBindings: []pagination.SortBinding[string]{
+			{Key: "name", Fn: strings.Compare},
+		},
 	}
-	wg.Wait()
+	result := config.SearchOrderAndPaginate(names, params)
+	return result.Items, pagination.BuildResponse(result.TotalCount, result.TotalAvailable, params)
 }
 
-func fillTagDetailsInternal(ctx context.Context, repo name.Repository, options []remote.Option, tag *containerregistry.RepositoryTag) error {
-	options = append(slices.Clip(options), remote.WithContext(ctx))
-	descriptor, err := remote.Get(repo.Tag(tag.Name), options...)
+// tagDetailsInternal resolves the manifest behind a tag. A single image yields
+// one platform; an index yields one per platform image, skipping attestations.
+func tagDetailsInternal(repo name.Repository, options []remote.Option, tagName string) (containerregistry.RepositoryTag, error) {
+	tag := containerregistry.RepositoryTag{Name: tagName, Platforms: []containerregistry.TagPlatform{}}
+
+	descriptor, err := remote.Get(repo.Tag(tagName), options...)
 	if err != nil {
-		return err
+		return tag, err
 	}
 	tag.Digest = descriptor.Digest.String()
 	tag.MediaType = string(descriptor.MediaType)
 
-	if descriptor.MediaType.IsIndex() {
-		return fillIndexTagDetailsInternal(descriptor, tag)
+	if !descriptor.MediaType.IsIndex() {
+		img, err := descriptor.Image()
+		if err != nil {
+			return tag, err
+		}
+		config, err := img.ConfigFile()
+		if err != nil {
+			return tag, err
+		}
+		platform, err := tagPlatformInternal(img, config.Platform(), descriptor.Digest)
+		if err != nil {
+			return tag, err
+		}
+		tag.Platforms = []containerregistry.TagPlatform{platform}
+		tag.Size = platform.Size
+		if !config.Created.IsZero() {
+			created := config.Created.UTC()
+			tag.Created = &created
+		}
+		return tag, nil
 	}
 
-	img, err := descriptor.Image()
-	if err != nil {
-		return err
-	}
-	platform, created, err := imagePlatformInternal(img, tag.Digest)
-	if err != nil {
-		return err
-	}
-	tag.Platforms = []containerregistry.TagPlatform{platform}
-	tag.Size = platform.Size
-	tag.Created = created
-	return nil
-}
-
-func fillIndexTagDetailsInternal(descriptor *remote.Descriptor, tag *containerregistry.RepositoryTag) error {
 	index, err := descriptor.ImageIndex()
 	if err != nil {
-		return err
+		return tag, err
 	}
 	manifest, err := index.IndexManifest()
 	if err != nil {
-		return err
+		return tag, err
 	}
 
-	var (
-		mu        sync.Mutex
-		platforms []containerregistry.TagPlatform
-	)
+	var mu sync.Mutex
 	group := errgroup.Group{}
 	group.SetLimit(tagDetailsConcurrency)
 	for _, child := range manifest.Manifests {
-		// Skip attestation manifests and nested indexes.
 		if child.Platform == nil || child.Platform.OS == "unknown" || !child.MediaType.IsImage() {
 			continue
 		}
 		group.Go(func() error {
-			platform := containerregistry.TagPlatform{
-				OS:           child.Platform.OS,
-				Architecture: child.Platform.Architecture,
-				Variant:      child.Platform.Variant,
-				Digest:       child.Digest.String(),
-			}
 			img, err := index.Image(child.Digest)
 			if err != nil {
 				return err
 			}
-			size, err := imageSizeInternal(img)
+			platform, err := tagPlatformInternal(img, child.Platform, child.Digest)
 			if err != nil {
 				return err
 			}
-			platform.Size = size
-
 			mu.Lock()
-			platforms = append(platforms, platform)
+			tag.Platforms = append(tag.Platforms, platform)
+			tag.Size += platform.Size
 			mu.Unlock()
 			return nil
 		})
 	}
 	if err := group.Wait(); err != nil {
-		return err
+		return tag, err
 	}
 
-	sortTagPlatformsInternal(platforms)
-	tag.Platforms = platforms
-	for _, platform := range platforms {
-		tag.Size += platform.Size
-	}
-	return nil
-}
-
-func imagePlatformInternal(img v1.Image, digest string) (containerregistry.TagPlatform, *time.Time, error) {
-	size, err := imageSizeInternal(img)
-	if err != nil {
-		return containerregistry.TagPlatform{}, nil, err
-	}
-	config, err := img.ConfigFile()
-	if err != nil {
-		return containerregistry.TagPlatform{}, nil, err
-	}
-	platform := containerregistry.TagPlatform{
-		OS:           config.OS,
-		Architecture: config.Architecture,
-		Variant:      config.Variant,
-		Digest:       digest,
-		Size:         size,
-	}
-	if config.Created.IsZero() {
-		return platform, nil, nil
-	}
-	created := config.Created.UTC()
-	return platform, &created, nil
-}
-
-// imageSizeInternal sums the compressed config and layer sizes of an image manifest.
-func imageSizeInternal(img v1.Image) (int64, error) {
-	manifest, err := img.Manifest()
-	if err != nil {
-		return 0, err
-	}
-	size := manifest.Config.Size
-	for _, layer := range manifest.Layers {
-		size += layer.Size
-	}
-	return size, nil
-}
-
-func sortTagPlatformsInternal(platforms []containerregistry.TagPlatform) {
-	slices.SortFunc(platforms, func(a, b containerregistry.TagPlatform) int {
+	slices.SortFunc(tag.Platforms, func(a, b containerregistry.TagPlatform) int {
 		return cmp.Or(
 			strings.Compare(a.OS, b.OS),
 			strings.Compare(a.Architecture, b.Architecture),
 			strings.Compare(a.Variant, b.Variant),
 		)
 	})
+	return tag, nil
+}
+
+// tagPlatformInternal describes one platform image with its compressed config and layer size.
+func tagPlatformInternal(img v1.Image, platform *v1.Platform, digest v1.Hash) (containerregistry.TagPlatform, error) {
+	manifest, err := img.Manifest()
+	if err != nil {
+		return containerregistry.TagPlatform{}, err
+	}
+	result := containerregistry.TagPlatform{Digest: digest.String(), Size: manifest.Config.Size}
+	for _, layer := range manifest.Layers {
+		result.Size += layer.Size
+	}
+	if platform != nil {
+		result.OS = platform.OS
+		result.Architecture = platform.Architecture
+		result.Variant = platform.Variant
+	}
+	return result, nil
 }
 
 // classifyBrowseErrorInternal maps distribution API failures to API error kinds.
@@ -359,21 +303,19 @@ func classifyBrowseErrorInternal(err error, message string) error {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return common.Classify(common.ErrTimeout, errors.WrapIf(err, message))
 	}
+	// Upstream auth failures are not Arcane permission failures, so they must not map to 401/403.
+	if isUnauthorizedRegistryErrorInternal(err) {
+		return common.Classify(common.ErrBadRequest, errors.WrapIf(err, message+": the registry denied access with the configured credentials"))
+	}
 
 	var transportErr *transport.Error
-	if !errors.As(err, &transportErr) {
-		return common.Classify(common.ErrUnavailable, errors.WrapIf(err, message))
+	if errors.As(err, &transportErr) {
+		switch transportErr.StatusCode {
+		case http.StatusNotFound:
+			return common.Classify(common.ErrNotFound, errors.WrapIf(err, message))
+		case http.StatusMethodNotAllowed:
+			return common.Classify(common.ErrBadRequest, errors.WrapIf(err, message+": the registry does not allow this operation"))
+		}
 	}
-
-	// Upstream auth failures are not Arcane permission failures, so they must not map to 401/403.
-	switch transportErr.StatusCode {
-	case http.StatusUnauthorized, http.StatusForbidden:
-		return common.Classify(common.ErrBadRequest, errors.WrapIf(err, message+": the registry denied access with the configured credentials"))
-	case http.StatusNotFound:
-		return common.Classify(common.ErrNotFound, errors.WrapIf(err, message))
-	case http.StatusMethodNotAllowed:
-		return common.Classify(common.ErrBadRequest, errors.WrapIf(err, message+": the registry does not allow this operation"))
-	default:
-		return common.Classify(common.ErrUnavailable, errors.WrapIf(err, message))
-	}
+	return common.Classify(common.ErrUnavailable, errors.WrapIf(err, message))
 }

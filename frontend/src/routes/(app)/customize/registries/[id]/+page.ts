@@ -1,17 +1,13 @@
 import { tryCatch } from '#lib/utils/try-catch.js';
 import { containerRegistryService } from '#lib/services/container-registry-service.js';
 import { queryKeys } from '#lib/query/query-keys.js';
-import type { RegistryTag } from '#lib/types/docker.js';
+import type { RegistryRepository, RegistryTag } from '#lib/types/docker.js';
 import type { Paginated, SearchPaginationSortRequest } from '#lib/types/shared.js';
 import { extractApiErrorMessage, throwPageLoadError } from '#lib/utils/api.js';
 import { m } from '#lib/paraglide/messages.js';
 import type { PageLoad } from './$types';
 
-const catalogRequest: SearchPaginationSortRequest = {
-	pagination: { page: 1, limit: 500 },
-	sort: { column: 'name', direction: 'asc' }
-};
-
+const catalogPageSize = 500;
 const tagsPageSize = 50;
 
 export const load: PageLoad = async ({ params, parent, url }) => {
@@ -27,15 +23,6 @@ export const load: PageLoad = async ({ params, parent, url }) => {
 		throwPageLoadError(registryResult.error, m.common_load_failed({ resource: m.resource_registry() }));
 	}
 
-	// Registries without a catalog API fail here; the page offers opening a repository by name instead.
-	const catalogResult = await tryCatch(
-		queryClient.query({
-			queryKey: queryKeys.containerRegistries.repositories(params.id, catalogRequest),
-			queryFn: () => containerRegistryService.getRepositories(params.id, catalogRequest),
-			staleTime: 30_000
-		})
-	);
-
 	const repository =
 		url.searchParams
 			.get('repository')
@@ -43,6 +30,30 @@ export const load: PageLoad = async ({ params, parent, url }) => {
 			.replace(/^\/+|\/+$/g, '') ?? '';
 	const search = url.searchParams.get('search')?.trim() ?? '';
 	const page = Math.max(1, Number(url.searchParams.get('page')) || 1);
+
+	// The catalog is only needed for the repository grid. Registries without a
+	// catalog API fail here, and the page offers opening a repository by name instead.
+	let catalog: Paginated<RegistryRepository> | null = null;
+	let catalogError: string | null = null;
+	if (!repository) {
+		const catalogRequest: SearchPaginationSortRequest = {
+			search,
+			pagination: { page: 1, limit: catalogPageSize },
+			sort: { column: 'name', direction: 'asc' }
+		};
+		const catalogResult = await tryCatch(
+			queryClient.query({
+				queryKey: queryKeys.containerRegistries.repositories(params.id, catalogRequest),
+				queryFn: () => containerRegistryService.getRepositories(params.id, catalogRequest),
+				staleTime: 30_000
+			})
+		);
+		if (catalogResult.error === null) {
+			catalog = catalogResult.data;
+		} else {
+			catalogError = extractApiErrorMessage(catalogResult.error);
+		}
+	}
 	const tagsRequest: SearchPaginationSortRequest = {
 		search,
 		pagination: { page, limit: tagsPageSize },
@@ -70,8 +81,8 @@ export const load: PageLoad = async ({ params, parent, url }) => {
 
 	return {
 		registry: registryResult.data,
-		catalog: catalogResult.data,
-		catalogError: catalogResult.error === null ? null : extractApiErrorMessage(catalogResult.error),
+		catalog,
+		catalogError,
 		repository,
 		search,
 		tags,

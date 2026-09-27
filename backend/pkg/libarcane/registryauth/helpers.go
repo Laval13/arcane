@@ -49,6 +49,11 @@ func SplitRegistryURL(url string) (host, namespace string) {
 	if host == "registry-1.docker.io" || host == "index.docker.io" {
 		host = "docker.io"
 	}
+	// "https://index.docker.io/v1/" is Docker Hub's API path, not a namespace.
+	if host == "docker.io" {
+		namespace = strings.TrimPrefix(strings.TrimPrefix(namespace, "v1/"), "v1")
+		namespace = strings.TrimPrefix(namespace, "/")
+	}
 	return host, namespace
 }
 

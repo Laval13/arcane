@@ -47,6 +47,9 @@ func TestSplitRegistryURL(t *testing.T) {
 		{"https://ghcr.io/acme/", "ghcr.io", "acme"},
 		{"http://localhost:5000/team/sub", "localhost:5000", "team/sub"},
 		{"registry-1.docker.io", "docker.io", ""},
+		{"https://index.docker.io/v1/", "docker.io", ""},
+		{"https://index.docker.io/v1/acme", "docker.io", "acme"},
+		{"docker.io/acme", "docker.io", "acme"},
 	}
 	for _, tt := range tests {
 		host, namespace := SplitRegistryURL(tt.in)

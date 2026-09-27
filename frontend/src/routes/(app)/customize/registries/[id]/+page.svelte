@@ -21,7 +21,7 @@
 	import { hasPermission } from '#lib/utils/auth.js';
 	import { bulkConfirmAndRun, confirmAndRun } from '#lib/utils/bulk-actions.js';
 	import { bytes, formatRelativeTime } from '#lib/utils/formatting.js';
-	import { buildImageReference } from '#lib/utils/registry.js';
+	import { buildImageReference, splitRegistryUrl } from '#lib/utils/registry.js';
 	import { debounced } from '#lib/utils/ws.js';
 
 	let { data } = $props();
@@ -29,29 +29,22 @@
 	const registry = $derived(data.registry);
 	const registryLabel = $derived(registry.url || 'docker.io');
 	// Repository names already carry any namespace from the registry URL.
-	const registryHost = $derived(registryLabel.replace(/^https?:\/\//, '').split('/')[0] ?? registryLabel);
-	const registryNamespace = $derived(
-		registryLabel
-			.replace(/^https?:\/\//, '')
-			.split('/')
-			.slice(1)
-			.join('/')
-	);
+	const { host: registryHost, namespace: registryNamespace } = $derived(splitRegistryUrl(registry.url));
 	const repository = $derived(data.repository);
 	const tags = $derived(data.tags);
 	const canDeleteTags = $derived(hasPermission('registries:delete-tags'));
 
-	let repositorySearch = $state('');
 	let selecting = $state(false);
 	let selected = $state<string[]>([]);
 	let deletingTag = $state<string | null>(null);
 	let bulkDeleting = $state(false);
 	let refreshing = $state(false);
 
-	const catalogNames = $derived(data.catalog?.data.map((item) => item.name) ?? registry.repositoryNames ?? []);
-	const repositories = $derived(
-		catalogNames.filter((name) => name.toLowerCase().includes(repositorySearch.trim().toLowerCase()))
+	// Configured names are relative to the registry URL namespace, like the build flow.
+	const configuredNames = $derived(
+		(registry.repositoryNames ?? []).map((name) => (registryNamespace ? `${registryNamespace}/${name}` : name))
 	);
+	const repositories = $derived(data.catalog?.data.map((item) => item.name) ?? configuredNames);
 
 	function navigate(patch: { repository?: string; search?: string; page?: number }) {
 		const params = new URLSearchParams();
@@ -65,12 +58,18 @@
 		goto(`/customize/registries/${registry.id}?${params}`, { reset: false });
 	}
 
-	const searchTags = debounced((value: string) => navigate({ search: value.trim(), page: 1 }), 300);
+	const search = debounced((value: string) => navigate({ search: value.trim(), page: 1 }), 300);
 
-	function openRepositoryByName(event: SubmitEvent) {
+	function submitRepositoryQuery(event: SubmitEvent) {
 		event.preventDefault();
-		const name = repositorySearch.trim().replace(/^\/+|\/+$/g, '');
-		if (name) navigate({ repository: name, search: '', page: 1 });
+		const value = String(new FormData(event.currentTarget as HTMLFormElement).get('query') ?? '')
+			.trim()
+			.replace(/^\/+|\/+$/g, '');
+		if (data.catalog) {
+			navigate({ search: value, page: 1 });
+		} else if (value) {
+			navigate({ repository: value, search: '', page: 1 });
+		}
 	}
 
 	function tagReference(tag: string) {
@@ -171,29 +170,31 @@
 
 {#snippet repositoryGrid()}
 	<div class="space-y-4">
-		<form class="flex flex-wrap items-center gap-2" onsubmit={openRepositoryByName}>
+		<form class="flex flex-wrap items-center gap-2" onsubmit={submitRepositoryQuery}>
 			<InputGroup.Root class="min-w-0 flex-1 md:w-80 md:flex-none">
 				<InputGroup.Addon>
 					<SearchIcon aria-hidden="true" />
 				</InputGroup.Addon>
-				<InputGroup.Input
-					bind:value={repositorySearch}
-					placeholder={data.catalog
-						? m.common_search()
-						: m.registries_open_repository_placeholder({ namespace: registryNamespace })}
-				/>
+				{#if data.catalog}
+					<InputGroup.Input
+						name="query"
+						value={data.search}
+						placeholder={m.common_search()}
+						oninput={(e) => search(e.currentTarget.value)}
+					/>
+				{:else}
+					<InputGroup.Input
+						name="query"
+						placeholder={m.registries_open_repository_placeholder({ namespace: registryNamespace })}
+					/>
+				{/if}
 			</InputGroup.Root>
 			{#if data.catalogError}
-				<ArcaneButton
-					action="inspect"
-					type="submit"
-					customLabel={m.registries_open_repository()}
-					disabled={!repositorySearch.trim()}
-				/>
+				<ArcaneButton action="inspect" type="submit" customLabel={m.registries_open_repository()} />
 			{/if}
 		</form>
 
-		{#if data.catalogError && catalogNames.length > 0}
+		{#if data.catalogError && repositories.length > 0}
 			<p class="text-sm text-muted-foreground">{m.registries_catalog_unavailable_configured()}</p>
 		{/if}
 
@@ -218,12 +219,12 @@
 					</button>
 				{/each}
 			</div>
-			{#if data.catalog && data.catalog.pagination.totalItems > catalogNames.length}
+			{#if data.catalog && data.catalog.pagination.totalItems > repositories.length}
 				<p class="text-xs text-muted-foreground">
-					{m.common_showing_of_total({ shown: catalogNames.length, total: data.catalog.pagination.totalItems })}
+					{m.common_showing_of_total({ shown: repositories.length, total: data.catalog.pagination.totalItems })}
 				</p>
 			{/if}
-		{:else if catalogNames.length > 0}
+		{:else if data.catalog}
 			<EmptyState icon={SearchIcon} title={m.common_no_results_found()} description={m.common_no_results_hint()} />
 		{:else if data.catalogError}
 			<EmptyState
@@ -236,8 +237,6 @@
 					<p class="border-t px-4 py-3 font-mono text-xs break-all text-muted-foreground">{data.catalogError}</p>
 				</details>
 			</EmptyState>
-		{:else}
-			<EmptyState icon={RegistryIcon} title={m.registries_no_repository_names()} />
 		{/if}
 	</div>
 {/snippet}
@@ -266,11 +265,7 @@
 				<InputGroup.Addon>
 					<SearchIcon aria-hidden="true" />
 				</InputGroup.Addon>
-				<InputGroup.Input
-					value={data.search}
-					placeholder={m.common_search()}
-					oninput={(e) => searchTags(e.currentTarget.value)}
-				/>
+				<InputGroup.Input value={data.search} placeholder={m.common_search()} oninput={(e) => search(e.currentTarget.value)} />
 			</InputGroup.Root>
 			{#if canDeleteTags && tags.data.length > 0}
 				<div class="ml-auto flex items-center gap-2">

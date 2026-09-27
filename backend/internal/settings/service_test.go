@@ -3,6 +3,7 @@ package settings
 import (
 	"context"
 	"encoding/base64"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -76,6 +77,23 @@ func waitForSettingsNotificationsInternal(t *testing.T, svc *SettingsService) {
 		return actors.NoPayload{}, nil
 	}, nil)
 	require.NoError(t, err)
+}
+
+func TestSettingsService_EnsureDefaultSettings_ReplacesRetiredDefaults(t *testing.T) {
+	ctx := context.Background()
+	db := setupSettingsTestDB(t)
+	svc, err := newSettingsServiceForTestInternal(t, ctx, db)
+	require.NoError(t, err)
+	require.NoError(t, db.Create(&SettingVariable{Key: "dockerClientRefreshInterval", Value: "*/30 * * * * *"}).Error)
+	require.NoError(t, db.Create(&SettingVariable{Key: "autoHealInterval", Value: "*/10 * * * * *"}).Error)
+
+	require.NoError(t, svc.EnsureDefaultSettings(ctx))
+
+	var retired, custom SettingVariable
+	require.NoError(t, db.First(&retired, "key = ?", "dockerClientRefreshInterval").Error)
+	require.Equal(t, "0 */5 * * * *", retired.Value, "the retired default moves to the current default")
+	require.NoError(t, db.First(&custom, "key = ?", "autoHealInterval").Error)
+	require.Equal(t, "*/10 * * * * *", custom.Value, "a customised value is left alone")
 }
 
 func TestSettingsService_EnsureDefaultSettings_Idempotent(t *testing.T) {
@@ -838,7 +856,10 @@ func TestSettingsService_LoadDatabaseSettings_UIConfigurationDisabled_Env(t *tes
 	// Set env + disable flag BEFORE service init
 	t.Setenv("UI_CONFIGURATION_DISABLED", "true")
 	t.Setenv("PROJECTS_DIRECTORY", "env/projects")
-	t.Setenv("BASE_SERVER_URL", "https://env.example")
+	// One value as a variable, one as a Docker secret file.
+	baseURLFile := filepath.Join(t.TempDir(), "base-server-url")
+	require.NoError(t, os.WriteFile(baseURLFile, []byte("https://env.example\n"), 0o600))
+	t.Setenv("BASE_SERVER_URL_FILE", baseURLFile)
 
 	c := config.Load()
 	c.UIConfigurationDisabled = true

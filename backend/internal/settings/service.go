@@ -209,7 +209,7 @@ func DefaultSettingsConfig() *Settings {
 		PollingEnabled:                        SettingVariable{Value: "true"},
 		PollingInterval:                       SettingVariable{Value: "0 0 * * * *"},
 		ImageEventWatcherEnabled:              SettingVariable{Value: "false"},
-		DockerClientRefreshInterval:           SettingVariable{Value: "*/30 * * * * *"},
+		DockerClientRefreshInterval:           SettingVariable{Value: "0 */5 * * * *"},
 		EventCleanupInterval:                  SettingVariable{Value: "0 0 */6 * * *"},
 		ExpiredSessionsCleanupInterval:        SettingVariable{Value: "0 0 0 * * *"},
 		ActivityHistoryRetentionDays:          SettingVariable{Value: "30"},
@@ -231,7 +231,7 @@ func DefaultSettingsConfig() *Settings {
 		PruneBuildCacheMode:                   SettingVariable{Value: "none"},
 		PruneBuildCacheUntil:                  SettingVariable{Value: ""},
 		AutoHealEnabled:                       SettingVariable{Value: "false"},
-		AutoHealInterval:                      SettingVariable{Value: "*/30 * * * * *"},
+		AutoHealInterval:                      SettingVariable{Value: "0 */5 * * * *"},
 		AutoHealExcludedContainers:            SettingVariable{Value: ""},
 		AutoHealMaxRestarts:                   SettingVariable{Value: "5"},
 		AutoHealRestartWindow:                 SettingVariable{Value: "30"},
@@ -379,7 +379,7 @@ func (s *SettingsService) loadDatabaseConfigFromEnv(ctx context.Context, db *dat
 		envVarName := strings.ToUpper(utils.CamelCaseToSnakeCase(key))
 
 		// debug: log each env name checked and whether a value exists
-		if val, ok := os.LookupEnv(envVarName); ok {
+		if val, ok, _ := utils.LookupEnvOrFile(envVarName); ok {
 			mask := "<empty>"
 			if len(val) > 0 {
 				mask = fmt.Sprintf("%d chars", len(val))
@@ -440,7 +440,7 @@ func resolveSettingsEnvOverridesInternal() []settingsEnvOverride {
 		}
 
 		envVarName := strings.ToUpper(utils.CamelCaseToSnakeCase(key))
-		if val, ok := os.LookupEnv(envVarName); ok && val != "" {
+		if val, ok, _ := utils.LookupEnvOrFile(envVarName); ok && val != "" {
 			overrides = append(overrides, settingsEnvOverride{
 				fieldIndex: i,
 				key:        key,
@@ -764,6 +764,13 @@ func (s *SettingsService) persistSettings(ctx context.Context, values []SettingV
 	})
 }
 
+// retiredSettingValuesInternal lists former defaults that startup replaces
+// with the current default when an install still holds them verbatim.
+var retiredSettingValuesInternal = map[string][]string{
+	"dockerClientRefreshInterval": {"*/30 * * * * *"},
+	"autoHealInterval":            {"*/30 * * * * *"},
+}
+
 func (s *SettingsService) EnsureDefaultSettings(ctx context.Context) error {
 	_, err := s.writes.Execute(ctx, "ensure default settings", func(writeCtx context.Context) (actors.NoPayload, error) {
 		defaultSettings := s.getDefaultSettings()
@@ -781,6 +788,10 @@ func (s *SettingsService) EnsureDefaultSettings(ctx context.Context) error {
 					}
 				case err != nil:
 					return errors.WrapIff(err, "failed to check for existing setting %s", defaultSetting.Key)
+				case slices.Contains(retiredSettingValuesInternal[defaultSetting.Key], existing.Value):
+					if err := tx.Model(&SettingVariable{}).Where("key = ?", defaultSetting.Key).Update("value", defaultSetting.Value).Error; err != nil {
+						return errors.WrapIff(err, "failed to replace retired default for setting %s", defaultSetting.Key)
+					}
 				}
 			}
 			return nil
@@ -863,7 +874,7 @@ func (s *SettingsService) processEnvField(ctx context.Context, tx *gorm.DB, fiel
 	}
 
 	envVarName := strings.ToUpper(utils.CamelCaseToSnakeCase(key))
-	envVal, ok := os.LookupEnv(envVarName)
+	envVal, ok, _ := utils.LookupEnvOrFile(envVarName)
 	if !ok {
 		return nil
 	}
@@ -1172,7 +1183,7 @@ func (s *SettingsService) NormalizeProjectsDirectory(ctx context.Context, projec
 func (s *SettingsService) NormalizeBuildsDirectory(ctx context.Context) error {
 	const buildsKey = "buildsDirectory"
 	envVarName := strings.ToUpper(utils.CamelCaseToSnakeCase(buildsKey))
-	if envVal, ok := os.LookupEnv(envVarName); ok && strings.TrimSpace(envVal) != "" {
+	if envVal, ok, _ := utils.LookupEnvOrFile(envVarName); ok && strings.TrimSpace(envVal) != "" {
 		slog.DebugContext(ctx, "BUILDS_DIRECTORY environment variable is set, skipping normalization", "value", envVal)
 		return nil
 	}
